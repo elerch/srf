@@ -36,7 +36,8 @@ array::array's don't exist. Use json or toml or something
 data with newlines must have a length:7:foo
 bar
 boolean value:bool:false
-  # Empty line separates records
+
+  # Empty line separates records, but comments don't count as empty
 key::this is the second record
 this is a number:num:42 
 null value:null:
