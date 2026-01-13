@@ -41,8 +41,7 @@ pub const ParseError = error{
 const ItemValueWithMetaData = struct {
     item_value: ?ItemValue,
     error_parsing: bool = false,
-    ending_byte: usize,
-    column_set: bool = false,
+    reader_advanced: bool = false,
 };
 pub const ItemValue = union(enum) {
     number: f128,
@@ -84,9 +83,12 @@ pub const ItemValue = union(enum) {
             // delimiter ended string
             var it = std.mem.splitScalar(u8, str[type_val_sep + 1 ..], delimiter);
             const val = it.first();
+            // we need to advance the column/partial_line_column of our parsing state
+            const total_chars = metadata.len + 1 + val.len;
+            state.column += total_chars;
+            state.partial_line_column += total_chars;
             return .{
                 .item_value = .{ .string = try allocator.dupe(u8, val) },
-                .ending_byte = metadata.len + 1 + val.len,
             };
         }
         if (std.mem.eql(u8, "binary", trimmed_meta)) {
@@ -94,12 +96,15 @@ pub const ItemValue = union(enum) {
             // risk delimiter collision, so we don't need a length for this
             var it = std.mem.splitScalar(u8, str[type_val_sep + 1 ..], delimiter);
             const val = it.first();
+            // we need to advance the column/partial_line_column of our parsing state
+            const total_chars = metadata.len + 1 + val.len;
+            state.column += total_chars;
+            state.partial_line_column += total_chars;
             const Decoder = std.base64.standard.Decoder;
             const size = Decoder.calcSizeForSlice(val) catch {
                 try parseError(allocator, options, "error parsing base64 value", state.*);
                 return .{
                     .item_value = null,
-                    .ending_byte = metadata.len + 1 + val.len,
                     .error_parsing = true,
                 };
             };
@@ -110,71 +115,83 @@ pub const ItemValue = union(enum) {
                 allocator.free(data);
                 return .{
                     .item_value = null,
-                    .ending_byte = metadata.len + 1 + val.len,
                     .error_parsing = true,
                 };
             };
             return .{
                 .item_value = .{ .bytes = data },
-                .ending_byte = metadata.len + 1 + val.len,
             };
         }
         if (std.mem.eql(u8, "num", trimmed_meta)) {
             var it = std.mem.splitScalar(u8, str[type_val_sep + 1 ..], delimiter);
             const val = it.first();
+            // we need to advance the column/partial_line_column of our parsing state
+            const total_chars = metadata.len + 1 + val.len;
+            log.debug("num total_chars: {d}", .{total_chars});
+            state.column += total_chars;
+            state.partial_line_column += total_chars;
             const val_trimmed = std.mem.trim(u8, val, &std.ascii.whitespace);
             const number = std.fmt.parseFloat(@FieldType(ItemValue, "number"), val_trimmed) catch {
-                // TODO: in compact format we really need a column number here
                 try parseError(allocator, options, "error parsing numeric value", state.*);
                 return .{
                     .item_value = null,
-                    .ending_byte = metadata.len + 1 + val.len,
                     .error_parsing = true,
                 };
             };
             return .{
                 .item_value = .{ .number = number },
-                .ending_byte = metadata.len + 1 + val.len,
             };
         }
         if (std.mem.eql(u8, "bool", trimmed_meta)) {
             var it = std.mem.splitScalar(u8, str[type_val_sep + 1 ..], delimiter);
             const val = it.first();
+            // we need to advance the column/partial_line_column of our parsing state
+            const total_chars = metadata.len + 1 + val.len;
+            state.column += total_chars;
+            state.partial_line_column += total_chars;
             const val_trimmed = std.mem.trim(u8, val, &std.ascii.whitespace);
             const boolean = blk: {
                 if (std.mem.eql(u8, "false", val_trimmed)) break :blk false;
                 if (std.mem.eql(u8, "true", val_trimmed)) break :blk true;
 
-                // TODO: in compact format we really need a column number here
                 try parseError(allocator, options, "error parsing boolean value", state.*);
                 return .{
                     .item_value = null,
-                    .ending_byte = metadata.len + 1 + val.len,
                     .error_parsing = true,
                 };
             };
             return .{
                 .item_value = .{ .boolean = boolean },
-                .ending_byte = metadata.len + 1 + val.len,
             };
         }
         if (std.mem.eql(u8, "null", trimmed_meta)) {
+            // we need to advance the column/partial_line_column of our parsing state
+            const total_chars = metadata.len + 1;
+            state.column += total_chars;
+            state.partial_line_column += total_chars;
             return .{
                 .item_value = null,
-                .ending_byte = metadata.len + 2,
             };
         }
         // Last chance...the thing between these colons is a usize indicating
-        // the number of bytes to grab for a string
+        // the number of bytes to grab for a string. In case parseInt fails,
+        // we need to advance the position of our column counters
+        const total_metadata_chars = metadata.len + 1;
+        state.column += total_metadata_chars;
+        state.partial_line_column += total_metadata_chars;
         const size = std.fmt.parseInt(usize, trimmed_meta, 0) catch {
             log.debug("parseInt fail, trimmed_data: '{s}'", .{trimmed_meta});
             try parseError(allocator, options, "unrecognized metadata for key", state.*);
             return .{
                 .item_value = null,
-                .ending_byte = metadata.len + 1,
                 .error_parsing = true,
             };
         };
+        // Update again for number of bytes. All failures beyond this point are
+        // fatal, so this is safe.
+        state.column += size;
+        state.partial_line_column += size;
+
         // If we are being asked specifically for bytes, we no longer care about
         // delimiters. We just want raw bytes. This might adjust our line/column
         // in the parse state
@@ -184,7 +201,6 @@ pub const ItemValue = union(enum) {
             const val = rest_of_data[0..size];
             return .{
                 .item_value = .{ .string = val },
-                .ending_byte = metadata.len + 1 + val.len,
             };
         }
         // This is not enough, we need more data from the reader
@@ -209,15 +225,15 @@ pub const ItemValue = union(enum) {
         // else
         //     try std.mem.concat(allocator, u8, &.{ start, end });
         errdefer allocator.free(final);
-        log.debug("full val: {s}", .{final});
+        // log.debug("full val: {s}", .{final});
         std.debug.assert(final.len == size);
-        // Now we need to get the parse state correct
+        // Because we've now advanced the line, we need to reset everything
         state.line += std.mem.count(u8, final, "\n");
         state.column = final.len - std.mem.lastIndexOf(u8, final, "\n").?;
+        state.partial_line_column = state.column;
         return .{
             .item_value = .{ .string = final },
-            .ending_byte = metadata.len + 1 + final.len, // This is useless here
-            .column_set = true,
+            .reader_advanced = true,
         };
     }
 };
@@ -289,6 +305,7 @@ pub const ParseState = struct {
     reader: *std.Io.Reader,
     line: usize,
     column: usize,
+    partial_line_column: usize,
 
     pub fn format(self: ParseState, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         try writer.print("line: {}, col: {}", .{ self.line, self.column });
@@ -298,8 +315,8 @@ pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: Pars
     var long_format = false; // Default to compact format
     var require_eof = false; // Default to no eof required
     var eof_found: bool = false;
-    var state = ParseState{ .line = 0, .column = 0, .reader = reader };
-    const first_line = nextLine(reader, &state, '\n') orelse return ParseError.ParseFailed;
+    var state = ParseState{ .line = 0, .column = 0, .partial_line_column = 0, .reader = reader };
+    const first_line = nextLine(reader, &state) orelse return ParseError.ParseFailed;
 
     if (try Directive.parse(allocator, first_line, state, options)) |d| {
         if (d != .magic) try parseError(allocator, options, "Magic header not found on first line", state);
@@ -312,7 +329,7 @@ pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: Pars
         record_list.deinit(allocator);
     }
     const first_data = blk: {
-        while (nextLine(reader, &state, '\n')) |line| {
+        while (nextLine(reader, &state)) |line| {
             if (try Directive.parse(allocator, line, state, options)) |d| {
                 switch (d) {
                     .magic => try parseError(allocator, options, "Found a duplicate magic header", state),
@@ -321,7 +338,7 @@ pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: Pars
                     .require_eof => require_eof = true,
                     .eof => {
                         // there needs to be an eof then
-                        if (nextLine(reader, &state, '\n')) |_| {
+                        if (nextLine(reader, &state)) |_| {
                             try parseError(allocator, options, "Data found after #!eof", state);
                             return ParseError.ParseFailed; // this is terminal
                         } else return .{ .items = try record_list.toOwnedSlice(allocator) };
@@ -344,20 +361,22 @@ pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: Pars
     // Because in long format we don't have newline delimiter, that should really be a noop
     // but we need this for compact format
     const delimiter: u8 = if (long_format) '\n' else ',';
+    log.debug("", .{});
+    log.debug("first line:{?s}", .{line});
     while (line) |l| {
         if (std.mem.trim(u8, l, &std.ascii.whitespace).len == 0) {
             // empty lines can be signficant (to indicate a new record, but only once
             // a record is processed, which requires data first. That record processing
             // is at the bottom of the loop, so if an empty line is detected here, we can
             // safely ignore it
-            line = nextLine(reader, &state, '\n');
+            line = nextLine(reader, &state);
             continue;
         }
         if (try Directive.parse(allocator, l, state, options)) |d| {
             switch (d) {
                 .eof => {
                     // there needs to be an eof then
-                    if (nextLine(reader, &state, '\n')) |_| {
+                    if (nextLine(reader, &state)) |_| {
                         try parseError(allocator, options, "Data found after #!eof", state);
                         return ParseError.ParseFailed; // this is terminal
                     } else {
@@ -375,6 +394,10 @@ pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: Pars
         // key:stuff:value
         var it = std.mem.splitScalar(u8, l, ':');
         const key = it.next().?; // first one we get for free
+        if (key.len > 0) std.debug.assert(key[0] != delimiter);
+        const plc = state.partial_line_column;
+        state.column += key.len + 1;
+        state.partial_line_column += key.len + 1;
         const value = try ItemValue.parse(
             allocator,
             it.rest(),
@@ -382,18 +405,35 @@ pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: Pars
             delimiter,
             options,
         );
+        if (!long_format) {
+            log.debug("key:{s}", .{key});
+            log.debug("value:{?f}", .{value.item_value});
+            log.debug("partial_line_column:{d}", .{state.partial_line_column});
+            log.debug("line before ItemValue.parse:{s}", .{l[plc..]});
+            log.debug("line after  ItemValue.parse:{s}", .{l[state.partial_line_column..]});
+        }
+
         if (!value.error_parsing) {
             // std.debug.print("alloc on key: {s}, val: {?f}\n", .{ key, value.item_value });
             try items.append(allocator, .{ .key = try allocator.dupe(u8, key), .value = value.item_value });
         }
 
-        if (!value.column_set)
-            state.column = key.len + value.ending_byte;
+        if (value.reader_advanced and !long_format) {
+            // In compact format we'll stay on the same line
+            const real_column = state.column;
+            log.debug("reader advanced. Current pos line: {d}, col: {d}", .{ state.line, state.column });
+            line = nextLine(reader, &state);
+            // Reset line and column position, because we're actually staying on the same line now
+            state.line -= 1;
+            state.column = real_column + 1;
+            state.partial_line_column = 0;
+            log.debug("rest of line:{?s}", .{line});
+        }
+
         // The difference between compact and line here is that compact we will instead of
         // line = try nextLine, we will do something like line = line[42..]
-
         if (long_format) {
-            const maybe_line = nextLine(reader, &state, '\n');
+            const maybe_line = nextLine(reader, &state);
             if (maybe_line == null) {
                 // close out record, return
                 try record_list.append(allocator, .{
@@ -407,16 +447,27 @@ pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: Pars
                 try record_list.append(allocator, .{
                     .items = try items.toOwnedSlice(allocator),
                 });
-                line = nextLine(reader, &state, '\n');
+                line = nextLine(reader, &state);
             }
         } else {
-            line = l[state.column..];
+            // We should be on a delimiter, otherwise, we should be at the end
+            line = line.?[state.partial_line_column..]; // can't use l here because line may have been reassigned
+            state.partial_line_column = 0;
+            log.debug("compact format line:{?s}", .{line});
             if (line.?.len == 0) {
                 // close out record
+                log.debug("compact format line end of record", .{});
                 try record_list.append(allocator, .{
                     .items = try items.toOwnedSlice(allocator),
                 });
-                line = nextLine(reader, &state, '\n');
+                line = nextLine(reader, &state);
+                state.partial_line_column = 0;
+            } else {
+                if (line.?[0] != delimiter) {
+                    log.err("reset line for next item, first char not '{c}':{?s}", .{ delimiter, line });
+                    return error.ParseFailed;
+                }
+                line = line.?[1..];
             }
         }
     }
@@ -437,11 +488,12 @@ pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: Pars
 
 /// Takes the next line, trimming leading whitespace and ignoring comments
 /// Directives (comments starting with #!) are preserved
-fn nextLine(reader: *std.Io.Reader, state: *ParseState, delimiter: u8) ?[]const u8 {
+fn nextLine(reader: *std.Io.Reader, state: *ParseState) ?[]const u8 {
     while (true) {
         state.line += 1;
-        state.column = 0;
-        const raw_line = (reader.takeDelimiter(delimiter) catch return null) orelse return null;
+        state.column = 1; // column is human indexed (one-based)
+        state.partial_line_column = 0; // partial_line_column is zero indexed for computers
+        const raw_line = (reader.takeDelimiter('\n') catch return null) orelse return null;
         // we don't want to trim the end, as there might be a key/value field
         // with a string including important trailing whitespace
         const trimmed_line = std.mem.trimStart(u8, raw_line, &std.ascii.whitespace);
@@ -548,7 +600,6 @@ test "long format from README - generic data structures" {
     try std.testing.expectEqualStrings("boolean value", first.items[5].key);
     try std.testing.expect(!first.items[5].value.?.boolean);
 
-    // TODO: Second record
     const second = records.items[1];
     try std.testing.expectEqual(@as(usize, 5), second.items.len);
     try std.testing.expectEqualStrings("key", second.items[0].key);
@@ -564,10 +615,6 @@ test "long format from README - generic data structures" {
 }
 
 test "compact format from README - generic data structures" {
-    const lvl = std.testing.log_level;
-    defer std.testing.log_level = lvl;
-    std.testing.log_level = .debug;
-    if (true) return error.SkipZigTest;
     const data =
         \\#!srfv1 # mandatory comment with format and version. Parser instructions start with #!
         \\key::string value must have a length between colons or end with a comma,this is a number:num:5 ,null value:null:,array::array's don't exist. Use json or toml or something,data with newlines must have a length:7:foo
@@ -581,4 +628,23 @@ test "compact format from README - generic data structures" {
     const records = try parse(&reader, allocator, .{});
     defer records.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 2), records.items.len);
+    const first = records.items[0];
+    try std.testing.expectEqual(@as(usize, 6), first.items.len);
+    try std.testing.expectEqualStrings("key", first.items[0].key);
+    try std.testing.expectEqualStrings("string value must have a length between colons or end with a comma", first.items[0].value.?.string);
+    try std.testing.expectEqualStrings("this is a number", first.items[1].key);
+    try std.testing.expectEqual(@as(f128, 5), first.items[1].value.?.number);
+    try std.testing.expectEqualStrings("null value", first.items[2].key);
+    try std.testing.expect(first.items[2].value == null);
+    try std.testing.expectEqualStrings("array", first.items[3].key);
+    try std.testing.expectEqualStrings("array's don't exist. Use json or toml or something", first.items[3].value.?.string);
+    try std.testing.expectEqualStrings("data with newlines must have a length", first.items[4].key);
+    try std.testing.expectEqualStrings("foo\nbar", first.items[4].value.?.string);
+    try std.testing.expectEqualStrings("boolean value", first.items[5].key);
+    try std.testing.expect(!first.items[5].value.?.boolean);
+
+    const second = records.items[1];
+    try std.testing.expectEqual(@as(usize, 1), second.items.len);
+    try std.testing.expectEqualStrings("key", second.items[0].key);
+    try std.testing.expectEqualStrings("this is the second record", second.items[0].value.?.string);
 }
