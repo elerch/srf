@@ -361,8 +361,8 @@ pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: Pars
     // Because in long format we don't have newline delimiter, that should really be a noop
     // but we need this for compact format
     const delimiter: u8 = if (long_format) '\n' else ',';
-    log.debug("", .{});
-    log.debug("first line:{?s}", .{line});
+    // log.debug("", .{});
+    // log.debug("first line:{?s}", .{line});
     while (line) |l| {
         if (std.mem.trim(u8, l, &std.ascii.whitespace).len == 0) {
             // empty lines can be signficant (to indicate a new record, but only once
@@ -395,7 +395,6 @@ pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: Pars
         var it = std.mem.splitScalar(u8, l, ':');
         const key = it.next().?; // first one we get for free
         if (key.len > 0) std.debug.assert(key[0] != delimiter);
-        const plc = state.partial_line_column;
         state.column += key.len + 1;
         state.partial_line_column += key.len + 1;
         const value = try ItemValue.parse(
@@ -405,13 +404,6 @@ pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: Pars
             delimiter,
             options,
         );
-        if (!long_format) {
-            log.debug("key:{s}", .{key});
-            log.debug("value:{?f}", .{value.item_value});
-            log.debug("partial_line_column:{d}", .{state.partial_line_column});
-            log.debug("line before ItemValue.parse:{s}", .{l[plc..]});
-            log.debug("line after  ItemValue.parse:{s}", .{l[state.partial_line_column..]});
-        }
 
         if (!value.error_parsing) {
             // std.debug.print("alloc on key: {s}, val: {?f}\n", .{ key, value.item_value });
@@ -421,13 +413,11 @@ pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: Pars
         if (value.reader_advanced and !long_format) {
             // In compact format we'll stay on the same line
             const real_column = state.column;
-            log.debug("reader advanced. Current pos line: {d}, col: {d}", .{ state.line, state.column });
             line = nextLine(reader, &state);
             // Reset line and column position, because we're actually staying on the same line now
             state.line -= 1;
             state.column = real_column + 1;
             state.partial_line_column = 0;
-            log.debug("rest of line:{?s}", .{line});
         }
 
         // The difference between compact and line here is that compact we will instead of
@@ -453,10 +443,8 @@ pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: Pars
             // We should be on a delimiter, otherwise, we should be at the end
             line = line.?[state.partial_line_column..]; // can't use l here because line may have been reassigned
             state.partial_line_column = 0;
-            log.debug("compact format line:{?s}", .{line});
             if (line.?.len == 0) {
                 // close out record
-                log.debug("compact format line end of record", .{});
                 try record_list.append(allocator, .{
                     .items = try items.toOwnedSlice(allocator),
                 });
@@ -472,10 +460,6 @@ pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: Pars
         }
     }
     // Parsing complete. Add final record to list. Then, if there are any parse errors, throw
-    log.debug(
-        "Parse complete. Records parsed so far: {d}, Items in array (>0 means final record): {d}",
-        .{ record_list.items.len, items.items.len },
-    );
     if (items.items.len > 0)
         try record_list.append(allocator, .{
             .items = try items.toOwnedSlice(allocator),
