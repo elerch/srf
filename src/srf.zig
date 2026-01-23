@@ -16,6 +16,7 @@ pub const ParseLineError = struct {
 pub const Diagnostics = struct {
     errors: *std.ArrayList(ParseLineError),
     stop_after: usize = 10,
+    arena: std.heap.ArenaAllocator,
 
     pub fn addError(self: Diagnostics, allocator: std.mem.Allocator, err: ParseLineError) ParseError!void {
         if (self.errors.items.len >= self.stop_after) {
@@ -24,9 +25,14 @@ pub const Diagnostics = struct {
         }
         try self.errors.append(allocator, err);
     }
-    pub fn deinit(self: Diagnostics, allocator: std.mem.Allocator) void {
-        for (self.errors) |e| e.deinit(allocator);
-        self.errors.deinit(allocator);
+    pub fn deinit(self: RecordList) void {
+        // From parse, three things can happen:
+        // 1. Happy path - record comes back, deallocation happens on that deinit
+        // 2. Errors is returned, no diagnostics provided. Deallocation happens in parse on errdefer
+        // 3. Errors are returned, diagnostics provided. Deallocation happens here
+        const child_allocator = self.arena.child_allocator;
+        self.arena.deinit();
+        child_allocator.destroy(self.arena);
     }
 };
 
@@ -260,12 +266,13 @@ pub const Record = struct {
 };
 
 pub const RecordList = struct {
-    items: []Record,
+    list: std.ArrayList(Record),
+    arena: *std.heap.ArenaAllocator,
 
-    pub fn deinit(self: RecordList, allocator: std.mem.Allocator) void {
-        for (self.items) |r|
-            r.deinit(allocator);
-        allocator.free(self.items);
+    pub fn deinit(self: RecordList) void {
+        const child_allocator = self.arena.child_allocator;
+        self.arena.deinit();
+        child_allocator.destroy(self.arena);
     }
     pub fn format(self: RecordList, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         _ = self;
@@ -312,41 +319,46 @@ pub const ParseState = struct {
     }
 };
 pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: ParseOptions) ParseError!RecordList {
+    // create an arena allocator for everytyhing related to parsing
+    const arena: *std.heap.ArenaAllocator = try allocator.create(std.heap.ArenaAllocator);
+    errdefer if (options.diagnostics == null) allocator.destroy(arena);
+    arena.* = .init(allocator);
+    errdefer if (options.diagnostics == null) arena.deinit();
+    const aa = arena.allocator();
     var long_format = false; // Default to compact format
     var require_eof = false; // Default to no eof required
     var eof_found: bool = false;
     var state = ParseState{ .line = 0, .column = 0, .partial_line_column = 0, .reader = reader };
     const first_line = nextLine(reader, &state) orelse return ParseError.ParseFailed;
 
-    if (try Directive.parse(allocator, first_line, state, options)) |d| {
-        if (d != .magic) try parseError(allocator, options, "Magic header not found on first line", state);
-    } else try parseError(allocator, options, "Magic header not found on first line", state);
+    if (try Directive.parse(aa, first_line, state, options)) |d| {
+        if (d != .magic) try parseError(aa, options, "Magic header not found on first line", state);
+    } else try parseError(aa, options, "Magic header not found on first line", state);
 
     // Loop through the header material and configure our main parsing
-    var record_list: std.ArrayList(Record) = .empty;
-    errdefer {
-        for (record_list.items) |i| i.deinit(allocator);
-        record_list.deinit(allocator);
-    }
+    var parsed: RecordList = .{
+        .list = .empty,
+        .arena = arena,
+    };
     const first_data = blk: {
         while (nextLine(reader, &state)) |line| {
-            if (try Directive.parse(allocator, line, state, options)) |d| {
+            if (try Directive.parse(aa, line, state, options)) |d| {
                 switch (d) {
-                    .magic => try parseError(allocator, options, "Found a duplicate magic header", state),
+                    .magic => try parseError(aa, options, "Found a duplicate magic header", state),
                     .long_format => long_format = true,
                     .compact_format => long_format = false, // what if we have both?
                     .require_eof => require_eof = true,
                     .eof => {
                         // there needs to be an eof then
                         if (nextLine(reader, &state)) |_| {
-                            try parseError(allocator, options, "Data found after #!eof", state);
+                            try parseError(aa, options, "Data found after #!eof", state);
                             return ParseError.ParseFailed; // this is terminal
-                        } else return .{ .items = try record_list.toOwnedSlice(allocator) };
+                        } else return parsed;
                     },
                 }
             } else break :blk line;
         }
-        return .{ .items = try record_list.toOwnedSlice(allocator) };
+        return parsed;
     };
 
     // Main parsing. We already have the first line of data, which could
@@ -354,8 +366,8 @@ pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: Pars
     var line: ?[]const u8 = first_data;
     var items: std.ArrayList(Item) = .empty;
     errdefer {
-        for (items.items) |i| i.deinit(allocator);
-        items.deinit(allocator);
+        for (items.items) |i| i.deinit(aa);
+        items.deinit(aa);
     }
 
     // Because in long format we don't have newline delimiter, that should really be a noop
@@ -372,19 +384,19 @@ pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: Pars
             line = nextLine(reader, &state);
             continue;
         }
-        if (try Directive.parse(allocator, l, state, options)) |d| {
+        if (try Directive.parse(aa, l, state, options)) |d| {
             switch (d) {
                 .eof => {
                     // there needs to be an eof then
                     if (nextLine(reader, &state)) |_| {
-                        try parseError(allocator, options, "Data found after #!eof", state);
+                        try parseError(aa, options, "Data found after #!eof", state);
                         return ParseError.ParseFailed; // this is terminal
                     } else {
                         eof_found = true;
                         break;
                     }
                 },
-                else => try parseError(allocator, options, "Directive found after data started", state),
+                else => try parseError(aa, options, "Directive found after data started", state),
             }
             continue;
         }
@@ -398,7 +410,7 @@ pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: Pars
         state.column += key.len + 1;
         state.partial_line_column += key.len + 1;
         const value = try ItemValue.parse(
-            allocator,
+            aa,
             it.rest(),
             &state,
             delimiter,
@@ -407,7 +419,7 @@ pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: Pars
 
         if (!value.error_parsing) {
             // std.debug.print("alloc on key: {s}, val: {?f}\n", .{ key, value.item_value });
-            try items.append(allocator, .{ .key = try allocator.dupe(u8, key), .value = value.item_value });
+            try items.append(aa, .{ .key = try aa.dupe(u8, key), .value = value.item_value });
         }
 
         if (value.reader_advanced and !long_format) {
@@ -426,16 +438,16 @@ pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: Pars
             const maybe_line = nextLine(reader, &state);
             if (maybe_line == null) {
                 // close out record, return
-                try record_list.append(allocator, .{
-                    .items = try items.toOwnedSlice(allocator),
+                try parsed.list.append(aa, .{
+                    .items = try items.toOwnedSlice(aa),
                 });
                 break;
             }
             line = maybe_line.?;
             if (line.?.len == 0) {
                 // End of record
-                try record_list.append(allocator, .{
-                    .items = try items.toOwnedSlice(allocator),
+                try parsed.list.append(aa, .{
+                    .items = try items.toOwnedSlice(aa),
                 });
                 line = nextLine(reader, &state);
             }
@@ -445,8 +457,8 @@ pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: Pars
             state.partial_line_column = 0;
             if (line.?.len == 0) {
                 // close out record
-                try record_list.append(allocator, .{
-                    .items = try items.toOwnedSlice(allocator),
+                try parsed.list.append(aa, .{
+                    .items = try items.toOwnedSlice(aa),
                 });
                 line = nextLine(reader, &state);
                 state.partial_line_column = 0;
@@ -461,13 +473,13 @@ pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: Pars
     }
     // Parsing complete. Add final record to list. Then, if there are any parse errors, throw
     if (items.items.len > 0)
-        try record_list.append(allocator, .{
-            .items = try items.toOwnedSlice(allocator),
+        try parsed.list.append(aa, .{
+            .items = try items.toOwnedSlice(aa),
         });
     if (options.diagnostics) |d|
         if (d.errors.items.len > 0) return ParseError.ParseFailed;
     if (require_eof and !eof_found) return ParseError.ParseFailed;
-    return .{ .items = try record_list.toOwnedSlice(allocator) };
+    return parsed;
 }
 
 /// Takes the next line, trimming leading whitespace and ignoring comments
@@ -513,10 +525,10 @@ test "long format single record, no eof" {
     const allocator = std.testing.allocator;
     var reader = std.Io.Reader.fixed(data);
     const records = try parse(&reader, allocator, .{});
-    defer records.deinit(allocator);
-    try std.testing.expectEqual(@as(usize, 1), records.items.len);
-    try std.testing.expectEqual(@as(usize, 1), records.items[0].items.len);
-    const kvps = records.items[0].items;
+    defer records.deinit();
+    try std.testing.expectEqual(@as(usize, 1), records.list.items.len);
+    try std.testing.expectEqual(@as(usize, 1), records.list.items[0].items.len);
+    const kvps = records.list.items[0].items;
     try std.testing.expectEqualStrings("key", kvps[0].key);
     try std.testing.expectEqualStrings("string value, with any data except a \\n. an optional string length between the colons", kvps[0].value.?.string);
 }
@@ -535,8 +547,8 @@ test "long format from README - generic data structures, first record only" {
     const allocator = std.testing.allocator;
     var reader = std.Io.Reader.fixed(data);
     const records = try parse(&reader, allocator, .{});
-    defer records.deinit(allocator);
-    try std.testing.expectEqual(@as(usize, 1), records.items.len);
+    defer records.deinit();
+    try std.testing.expectEqual(@as(usize, 1), records.list.items.len);
 }
 
 test "long format from README - generic data structures" {
@@ -567,9 +579,9 @@ test "long format from README - generic data structures" {
     const allocator = std.testing.allocator;
     var reader = std.Io.Reader.fixed(data);
     const records = try parse(&reader, allocator, .{});
-    defer records.deinit(allocator);
-    try std.testing.expectEqual(@as(usize, 2), records.items.len);
-    const first = records.items[0];
+    defer records.deinit();
+    try std.testing.expectEqual(@as(usize, 2), records.list.items.len);
+    const first = records.list.items[0];
     try std.testing.expectEqual(@as(usize, 6), first.items.len);
     try std.testing.expectEqualStrings("key", first.items[0].key);
     try std.testing.expectEqualStrings("string value, with any data except a \\n. an optional string length between the colons", first.items[0].value.?.string);
@@ -584,7 +596,7 @@ test "long format from README - generic data structures" {
     try std.testing.expectEqualStrings("boolean value", first.items[5].key);
     try std.testing.expect(!first.items[5].value.?.boolean);
 
-    const second = records.items[1];
+    const second = records.list.items[1];
     try std.testing.expectEqual(@as(usize, 5), second.items.len);
     try std.testing.expectEqualStrings("key", second.items[0].key);
     try std.testing.expectEqualStrings("this is the second record", second.items[0].value.?.string);
@@ -610,9 +622,9 @@ test "compact format from README - generic data structures" {
     var reader = std.Io.Reader.fixed(data);
     // We want "parse" and "parseLeaky" probably. Second parameter is a diagnostics
     const records = try parse(&reader, allocator, .{});
-    defer records.deinit(allocator);
-    try std.testing.expectEqual(@as(usize, 2), records.items.len);
-    const first = records.items[0];
+    defer records.deinit();
+    try std.testing.expectEqual(@as(usize, 2), records.list.items.len);
+    const first = records.list.items[0];
     try std.testing.expectEqual(@as(usize, 6), first.items.len);
     try std.testing.expectEqualStrings("key", first.items[0].key);
     try std.testing.expectEqualStrings("string value must have a length between colons or end with a comma", first.items[0].value.?.string);
@@ -627,7 +639,7 @@ test "compact format from README - generic data structures" {
     try std.testing.expectEqualStrings("boolean value", first.items[5].key);
     try std.testing.expect(!first.items[5].value.?.boolean);
 
-    const second = records.items[1];
+    const second = records.list.items[1];
     try std.testing.expectEqual(@as(usize, 1), second.items.len);
     try std.testing.expectEqualStrings("key", second.items[0].key);
     try std.testing.expectEqualStrings("this is the second record", second.items[0].value.?.string);

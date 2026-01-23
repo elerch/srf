@@ -85,10 +85,7 @@ pub fn main() !void {
 
         var reader = std.Io.Reader.fixed(data.items);
         const records = try srf.parse(&reader, srf_allocator, .{});
-        defer {
-            for (records.items) |r| r.deinit(srf_allocator);
-            srf_allocator.free(records.items);
-        }
+        defer records.deinit();
     } else if (std.mem.eql(u8, format, "jsonl")) {
         var lines = std.mem.splitScalar(u8, data.items, '\n');
         while (lines.next()) |line| {
