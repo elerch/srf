@@ -153,4 +153,155 @@ pub fn build(b: *std.Build) void {
     //
     // Lastly, the Zig build system is relatively simple and self-contained,
     // and reading its source code will allow you to master it.
+
+    // Benchmark step
+    const benchmark_step = b.step("benchmark", "Run benchmarks with hyperfine");
+    const benchmark_optimize = if (optimize == .Debug) .ReleaseSafe else optimize;
+    const benchmark_record_count = 100_000;
+    const include_jsonl = b.option(bool, "benchmark-jsonl", "Include JSONL in benchmarks (slow)") orelse false;
+
+    // Check for hyperfine
+    const check_hyperfine = b.addSystemCommand(&.{ "sh", "-c", "command -v hyperfine >/dev/null 2>&1 || (echo 'Error: hyperfine not found. Install it with: cargo install hyperfine' >&2 && exit 1)" });
+    benchmark_step.dependOn(&check_hyperfine.step);
+
+    // Build test data generator
+    const gen_exe = b.addExecutable(.{
+        .name = "generate_test_data",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/generate_test_data.zig"),
+            .target = target,
+            .optimize = benchmark_optimize,
+        }),
+    });
+    const install_gen = b.addInstallArtifact(gen_exe, .{});
+    check_hyperfine.step.dependOn(&install_gen.step);
+
+    // Rebuild main executable with benchmark optimization
+    const benchmark_exe = b.addExecutable(.{
+        .name = "srf",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = benchmark_optimize,
+            .imports = &.{
+                .{ .name = "srf", .module = mod },
+            },
+        }),
+    });
+    const install_benchmark_exe = b.addInstallArtifact(benchmark_exe, .{});
+    check_hyperfine.step.dependOn(&install_benchmark_exe.step);
+
+    const run_benchmark = BenchmarkStep.create(b, .{
+        .gen_exe = gen_exe,
+        .srf_exe = benchmark_exe,
+        .record_count = benchmark_record_count,
+        .include_jsonl = include_jsonl,
+    });
+    run_benchmark.step.dependOn(&check_hyperfine.step);
+    benchmark_step.dependOn(&run_benchmark.step);
 }
+
+const BenchmarkStep = struct {
+    step: std.Build.Step,
+    gen_exe: *std.Build.Step.Compile,
+    srf_exe: *std.Build.Step.Compile,
+    record_count: usize,
+    include_jsonl: bool,
+
+    pub fn create(owner: *std.Build, options: struct {
+        gen_exe: *std.Build.Step.Compile,
+        srf_exe: *std.Build.Step.Compile,
+        record_count: usize,
+        include_jsonl: bool,
+    }) *BenchmarkStep {
+        const self = owner.allocator.create(BenchmarkStep) catch @panic("OOM");
+        self.* = .{
+            .step = std.Build.Step.init(.{
+                .id = .custom,
+                .name = "run benchmark",
+                .owner = owner,
+                .makeFn = make,
+            }),
+            .gen_exe = options.gen_exe,
+            .srf_exe = options.srf_exe,
+            .record_count = options.record_count,
+            .include_jsonl = options.include_jsonl,
+        };
+        return self;
+    }
+
+    fn make(step: *std.Build.Step, _: std.Build.Step.MakeOptions) !void {
+        const b = step.owner;
+        const self: *BenchmarkStep = @fieldParentPtr("step", step);
+
+        const gen_path = b.getInstallPath(.bin, self.gen_exe.name);
+        const exe_path = b.getInstallPath(.bin, self.srf_exe.name);
+        const count_str = b.fmt("{d}", .{self.record_count});
+
+        const formats = [_]struct { name: []const u8, ext: []const u8 }{
+            .{ .name = "srf-compact", .ext = "srf" },
+            .{ .name = "srf-long", .ext = "srf" },
+            .{ .name = "jsonl", .ext = "jsonl" },
+            .{ .name = "json", .ext = "json" },
+        };
+
+        var test_files: [4][]const u8 = undefined;
+        for (formats, 0..) |fmt, i| {
+            // Create hash from format name and record count
+            var hasher = std.hash.Wyhash.init(0);
+            hasher.update(fmt.name);
+            hasher.update(count_str);
+            const hash = hasher.final();
+
+            const hash_str = b.fmt("{x}", .{hash});
+            const cache_dir = b.cache_root.join(b.allocator, &.{ "o", hash_str }) catch @panic("OOM");
+            std.fs.cwd().makePath(cache_dir) catch {};
+
+            const filename = b.fmt("test-{s}.{s}", .{ fmt.name, fmt.ext });
+            const filepath = b.pathJoin(&.{ cache_dir, filename });
+            test_files[i] = filepath;
+
+            // Check if file exists
+            if (std.fs.cwd().access(filepath, .{})) {
+                continue; // File exists, skip generation
+            } else |_| {}
+
+            // Generate file
+            var child = std.process.Child.init(&.{ gen_path, fmt.name, count_str }, b.allocator);
+            child.stdout_behavior = .Pipe;
+            try child.spawn();
+
+            const output = try child.stdout.?.readToEndAlloc(b.allocator, 100 * 1024 * 1024);
+            defer b.allocator.free(output);
+
+            const term = try child.wait();
+            if (term != .Exited or term.Exited != 0) return error.GenerationFailed;
+
+            try std.fs.cwd().writeFile(.{ .sub_path = filepath, .data = output });
+        }
+
+        // Run hyperfine
+        var argv: std.ArrayList([]const u8) = .empty;
+        defer argv.deinit(b.allocator);
+
+        try argv.appendSlice(b.allocator, &.{ "hyperfine", "-w", "2" });
+        try argv.append(b.allocator, b.fmt("{s} srf <{s}", .{ exe_path, test_files[0] }));
+        try argv.append(b.allocator, b.fmt("{s} srf <{s}", .{ exe_path, test_files[1] }));
+        try argv.append(b.allocator, b.fmt("{s} json <{s}", .{ exe_path, test_files[3] }));
+        if (self.include_jsonl) {
+            try argv.append(b.allocator, b.fmt("{s} jsonl <{s}", .{ exe_path, test_files[2] }));
+        }
+
+        var child = std.process.Child.init(argv.items, b.allocator);
+
+        // We need to lock stderror so hyperfine can output progress in place
+        std.debug.lockStdErr();
+        defer std.debug.unlockStdErr();
+
+        try child.spawn();
+        const term = try child.wait();
+
+        if (term != .Exited or term.Exited != 0)
+            return error.BenchmarkFailed;
+    }
+};
