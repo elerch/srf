@@ -76,15 +76,8 @@ pub fn main() !void {
     try stdin.appendRemaining(base_allocator, &data, @enumFromInt(100 * 1024 * 1024));
 
     if (std.mem.eql(u8, format, "srf")) {
-        // TODO: Remove this code. SRF should be using an Arena allocator instead
-        const buffer = try base_allocator.alloc(u8, 200 * 1024 * 1024);
-        defer base_allocator.free(buffer);
-        var fba = std.heap.FixedBufferAllocator.init(buffer);
-        const srf_allocator = fba.allocator();
-        // remove ^^
-
         var reader = std.Io.Reader.fixed(data.items);
-        const records = try srf.parse(&reader, srf_allocator, .{});
+        const records = try srf.parse(&reader, allocator, .{});
         defer records.deinit();
     } else if (std.mem.eql(u8, format, "jsonl")) {
         var lines = std.mem.splitScalar(u8, data.items, '\n');
