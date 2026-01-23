@@ -44,7 +44,7 @@ const ItemValueWithMetaData = struct {
     reader_advanced: bool = false,
 };
 pub const ItemValue = union(enum) {
-    number: f128,
+    number: f64,
 
     /// Bytes are converted to/from base64, string is not
     bytes: []const u8,
@@ -574,7 +574,7 @@ test "long format from README - generic data structures" {
     try std.testing.expectEqualStrings("key", first.items[0].key);
     try std.testing.expectEqualStrings("string value, with any data except a \\n. an optional string length between the colons", first.items[0].value.?.string);
     try std.testing.expectEqualStrings("this is a number", first.items[1].key);
-    try std.testing.expectEqual(@as(f128, 5), first.items[1].value.?.number);
+    try std.testing.expectEqual(@as(f64, 5), first.items[1].value.?.number);
     try std.testing.expectEqualStrings("null value", first.items[2].key);
     try std.testing.expect(first.items[2].value == null);
     try std.testing.expectEqualStrings("array", first.items[3].key);
@@ -589,7 +589,7 @@ test "long format from README - generic data structures" {
     try std.testing.expectEqualStrings("key", second.items[0].key);
     try std.testing.expectEqualStrings("this is the second record", second.items[0].value.?.string);
     try std.testing.expectEqualStrings("this is a number", second.items[1].key);
-    try std.testing.expectEqual(@as(f128, 42), second.items[1].value.?.number);
+    try std.testing.expectEqual(@as(f64, 42), second.items[1].value.?.number);
     try std.testing.expectEqualStrings("null value", second.items[2].key);
     try std.testing.expect(second.items[2].value == null);
     try std.testing.expectEqualStrings("array", second.items[3].key);
@@ -617,7 +617,7 @@ test "compact format from README - generic data structures" {
     try std.testing.expectEqualStrings("key", first.items[0].key);
     try std.testing.expectEqualStrings("string value must have a length between colons or end with a comma", first.items[0].value.?.string);
     try std.testing.expectEqualStrings("this is a number", first.items[1].key);
-    try std.testing.expectEqual(@as(f128, 5), first.items[1].value.?.number);
+    try std.testing.expectEqual(@as(f64, 5), first.items[1].value.?.number);
     try std.testing.expectEqualStrings("null value", first.items[2].key);
     try std.testing.expect(first.items[2].value == null);
     try std.testing.expectEqualStrings("array", first.items[3].key);
