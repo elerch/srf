@@ -1,6 +1,6 @@
 # SRF (Simple Record Format)
 
-SRF is a minimal data format designed for L2 caches and simple structured storage suitable for simple configuration as well. It provides human-readable key-value records with basic type hints, while avoiding the parsing complexity and escaping requirements of JSON.
+SRF is a minimal data format designed for L2 caches and simple structured storage suitable for simple configuration as well. It provides human-readable key-value records with basic type hints, while avoiding the parsing complexity and escaping requirements of JSON. Current benchmarking with hyperfine demonstrate approximately twice the performance of JSON parsing, though for L2 caches, JSON may be a poor choice. Compared to jsonl, it is approximately 40x faster. Performance also improves by 8% if you instruct the library not to copy strings around (ParseOptions alloc_strings = false).
 
 **Features:**
 - No escaping required - use length-prefixed strings for complex data
@@ -53,23 +53,6 @@ key::string value must have a length between colons or end with a comma,this is 
 bar,boolean value:bool:false
 key::this is the second record
 ```
-
-Second record problem...these
-
-## Implementation
-
-**Note:** Long format may be tabled for later development. Initial implementation will focus on compact format only.
-
- Unrecognized `#!<keyword>` should be an error:
-  requireof -> requireeof will probably be a common problem.
-#! anywhere other than the beginning or end is an error
-
-newline separates records in compact format. An empty line is required in long format
-
-comma separates fields in compact format
-newline separates fields in long format
-
-Should we have a #!hash directive to include all data not starting with `#!` ?
 
 ## Implementation Concerns
 

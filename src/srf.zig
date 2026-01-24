@@ -68,13 +68,6 @@ pub const ItemValue = union(enum) {
             .boolean => try writer.print("boolean: {}", .{self.boolean}),
         }
     }
-    pub fn deinit(self: ItemValue, allocator: std.mem.Allocator) void {
-        switch (self) {
-            .number, .boolean => {},
-            .bytes => |b| allocator.free(b),
-            .string => |s| allocator.free(s),
-        }
-    }
     pub fn parse(allocator: std.mem.Allocator, str: []const u8, state: *ParseState, delimiter: u8, options: ParseOptions) ParseError!ItemValueWithMetaData {
         const type_val_sep_raw = std.mem.indexOfScalar(u8, str, ':');
         if (type_val_sep_raw == null) {
@@ -94,7 +87,7 @@ pub const ItemValue = union(enum) {
             state.column += total_chars;
             state.partial_line_column += total_chars;
             return .{
-                .item_value = .{ .string = try allocator.dupe(u8, val) },
+                .item_value = .{ .string = try dupe(allocator, options, val) },
             };
         }
         if (std.mem.eql(u8, "binary", trimmed_meta)) {
@@ -212,7 +205,7 @@ pub const ItemValue = union(enum) {
         // This is not enough, we need more data from the reader
         log.debug("item value includes newlines {f}", .{state});
         // We need to advance the reader, so we need a copy of what we have so fa
-        const start = try allocator.dupe(u8, rest_of_data);
+        const start = try dupe(allocator, options, rest_of_data);
         defer allocator.free(start);
         // We won't do a parseError here. If we have an allocation error, read
         // error, or end of stream, all of these are fatal. Our reader is currently
@@ -244,27 +237,44 @@ pub const ItemValue = union(enum) {
     }
 };
 
+// An item has a key and a value, but the value may be null
 pub const Item = struct {
     key: []const u8,
     value: ?ItemValue,
-
-    pub fn deinit(self: Item, allocator: std.mem.Allocator) void {
-        // std.debug.print("item deinit, key {s}, val: {?f}\n", .{ self.key, self.value });
-        allocator.free(self.key);
-        if (self.value) |v|
-            v.deinit(allocator);
-    }
 };
 
+// A record has a list of items, with no assumptions regarding duplication,
+// etc. This is for parsing speed, but also for more flexibility in terms of
+// use cases. One can make a defacto array out of this structure by having
+// something like:
+//
+// arr:string:foo
+// arr:string:bar
+//
+// and when you coerce to zig struct have an array .arr that gets populated
+// with strings "foo" and "bar".
 pub const Record = struct {
     items: []Item,
-
-    pub fn deinit(self: Record, allocator: std.mem.Allocator) void {
-        for (self.items) |i| i.deinit(allocator);
-        allocator.free(self.items);
-    }
 };
 
+/// The RecordList is equivalent to Parsed(T) in std.json. Since most are
+/// familiar with std.json, it differs in the following ways:
+///
+/// There is a list field instead of a value field. In json, one type of
+/// value is an array. SRF does not have an array data type, but the set of
+/// records is an array. json as a format is structred as a single object at
+/// the outermost
+///
+/// This is not generic. In SRF, it is a separate function to bind the list
+/// of records to a specific data type. This will add some (hopefully minimal)
+/// overhead, but also avoid conflating parsing from the coercion from general
+/// type to specifics, and avoids answering questions like "what if I have
+/// 15 values for the same key" until you're actually dealing with that problem
+/// (see std.json.ParseOptions duplicate_field_behavior and ignore_unknown_fields)
+///
+/// When implemented, there will include a pub fn bind(self: RecordList, comptime T: type, options, BindOptions) BindError![]T
+/// function. The options will include things related to duplicate handling and
+/// missing fields
 pub const RecordList = struct {
     list: std.ArrayList(Record),
     arena: *std.heap.ArenaAllocator,
@@ -282,6 +292,12 @@ pub const RecordList = struct {
 
 pub const ParseOptions = struct {
     diagnostics: ?*Diagnostics = null,
+
+    /// By default, the parser will copy data so it is safe to free the original
+    /// This will impose about 8% overhead, but be safer. If you do not require
+    /// this safety, set alloc_strings to false. Setting this to false is the
+    /// equivalent of the "Leaky" parsing functions of std.json
+    alloc_strings: bool = true,
 };
 
 const Directive = union(enum) {
@@ -498,11 +514,16 @@ fn nextLine(reader: *std.Io.Reader, state: *ParseState) ?[]const u8 {
     }
 }
 
+inline fn dupe(allocator: std.mem.Allocator, options: ParseOptions, data: []const u8) ParseError![]const u8 {
+    if (options.alloc_strings)
+        return try allocator.dupe(u8, data);
+    return data;
+}
 inline fn parseError(allocator: std.mem.Allocator, options: ParseOptions, message: []const u8, state: ParseState) ParseError!void {
     log.debug("Parse error. Parse state {f}, message: {s}", .{ state, message });
     if (options.diagnostics) |d| {
         try d.addError(allocator, .{
-            .message = try allocator.dupe(u8, message),
+            .message = try dupe(allocator, options, message),
             .level = .err,
             .line = state.line,
             .column = state.column,

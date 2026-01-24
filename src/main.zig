@@ -77,7 +77,7 @@ pub fn main() !void {
 
     if (std.mem.eql(u8, format, "srf")) {
         var reader = std.Io.Reader.fixed(data.items);
-        const records = try srf.parse(&reader, allocator, .{});
+        const records = try srf.parse(&reader, allocator, .{ .alloc_strings = false });
         defer records.deinit();
     } else if (std.mem.eql(u8, format, "jsonl")) {
         var lines = std.mem.splitScalar(u8, data.items, '\n');
