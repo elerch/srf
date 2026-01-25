@@ -1,4 +1,22 @@
-//! By convention, root.zig is the root source file when making a library.
+//!SRF is a minimal data format designed for L2 caches and simple structured storage suitable for simple configuration as well. It provides human-readable key-value records with basic type hints, while avoiding the parsing complexity and escaping requirements of JSON. Current benchmarking with hyperfine demonstrate approximately twice the performance of JSON parsing, though for L2 caches, JSON may be a poor choice. Compared to jsonl, it is approximately 40x faster. Performance also improves by 8% if you instruct the library not to copy strings around (ParseOptions alloc_strings = false).
+//!
+//!**Features:**
+//!- No escaping required - use length-prefixed strings for complex data
+//!- Single-pass parsing with minimal memory allocation
+//!- Basic type system (string, num, bool, null, binary) with explicit type hints
+//!- Compact format for machine generation, long format for human editing
+//!- Built-in corruption detection with optional EOF markers
+//!
+//!**When to use SRF:**
+//!- L2 caches that need occasional human inspection
+//!- Simple configuration files with mixed data types
+//!- Data exchange where JSON escaping is problematic
+//!- Applications requiring fast, predictable parsing
+//!
+//!**When not to use SRF:**
+//!- Complex nested data structures (use JSON/TOML instead)
+//!- Schema validation requirements
+//!- Arrays or object hierarchies (arrays can be managed in the data itself, however)
 const std = @import("std");
 
 const log = std.log.scoped(.srf);
@@ -25,7 +43,7 @@ pub const Diagnostics = struct {
         }
         try self.errors.append(allocator, err);
     }
-    pub fn deinit(self: RecordList) void {
+    pub fn deinit(self: Parsed) void {
         // From parse, three things can happen:
         // 1. Happy path - record comes back, deallocation happens on that deinit
         // 2. Errors is returned, no diagnostics provided. Deallocation happens in parse on errdefer
@@ -44,12 +62,12 @@ pub const ParseError = error{
     EndOfStream,
 };
 
-const ItemValueWithMetaData = struct {
-    item_value: ?ItemValue,
+const ValueWithMetaData = struct {
+    item_value: ?Value,
     error_parsing: bool = false,
     reader_advanced: bool = false,
 };
-pub const ItemValue = union(enum) {
+pub const Value = union(enum) {
     number: f64,
 
     /// Bytes are converted to/from base64, string is not
@@ -60,7 +78,7 @@ pub const ItemValue = union(enum) {
 
     boolean: bool,
 
-    pub fn format(self: ItemValue, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    pub fn format(self: Value, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         switch (self) {
             .number => try writer.print("num: {d}", .{self.number}),
             .bytes => try writer.print("bytes: {x}", .{self.bytes}),
@@ -68,7 +86,7 @@ pub const ItemValue = union(enum) {
             .boolean => try writer.print("boolean: {}", .{self.boolean}),
         }
     }
-    pub fn parse(allocator: std.mem.Allocator, str: []const u8, state: *ParseState, delimiter: u8, options: ParseOptions) ParseError!ItemValueWithMetaData {
+    pub fn parse(allocator: std.mem.Allocator, str: []const u8, state: *ParseState, delimiter: u8, options: ParseOptions) ParseError!ValueWithMetaData {
         const type_val_sep_raw = std.mem.indexOfScalar(u8, str, ':');
         if (type_val_sep_raw == null) {
             try parseError(allocator, options, "no type data or value after key", state.*);
@@ -130,7 +148,7 @@ pub const ItemValue = union(enum) {
             state.column += total_chars;
             state.partial_line_column += total_chars;
             const val_trimmed = std.mem.trim(u8, val, &std.ascii.whitespace);
-            const number = std.fmt.parseFloat(@FieldType(ItemValue, "number"), val_trimmed) catch {
+            const number = std.fmt.parseFloat(@FieldType(Value, "number"), val_trimmed) catch {
                 try parseError(allocator, options, "error parsing numeric value", state.*);
                 return .{
                     .item_value = null,
@@ -237,13 +255,13 @@ pub const ItemValue = union(enum) {
     }
 };
 
-// An item has a key and a value, but the value may be null
-pub const Item = struct {
+// A field has a key and a value, but the value may be null
+pub const Field = struct {
     key: []const u8,
-    value: ?ItemValue,
+    value: ?Value,
 };
 
-// A record has a list of items, with no assumptions regarding duplication,
+// A record has a list of fields, with no assumptions regarding duplication,
 // etc. This is for parsing speed, but also for more flexibility in terms of
 // use cases. One can make a defacto array out of this structure by having
 // something like:
@@ -254,37 +272,37 @@ pub const Item = struct {
 // and when you coerce to zig struct have an array .arr that gets populated
 // with strings "foo" and "bar".
 pub const Record = struct {
-    items: []Item,
+    fields: []Field,
 };
 
-/// The RecordList is equivalent to Parsed(T) in std.json. Since most are
+/// The Parsed struct is equivalent to Parsed(T) in std.json. Since most are
 /// familiar with std.json, it differs in the following ways:
 ///
-/// There is a list field instead of a value field. In json, one type of
+/// * There is a records field instead of a value field. In json, one type of
 /// value is an array. SRF does not have an array data type, but the set of
 /// records is an array. json as a format is structred as a single object at
 /// the outermost
 ///
-/// This is not generic. In SRF, it is a separate function to bind the list
+/// * This is not generic. In SRF, it is a separate function to bind the list
 /// of records to a specific data type. This will add some (hopefully minimal)
 /// overhead, but also avoid conflating parsing from the coercion from general
 /// type to specifics, and avoids answering questions like "what if I have
 /// 15 values for the same key" until you're actually dealing with that problem
 /// (see std.json.ParseOptions duplicate_field_behavior and ignore_unknown_fields)
 ///
-/// When implemented, there will include a pub fn bind(self: RecordList, comptime T: type, options, BindOptions) BindError![]T
+/// When implemented, there will include a pub fn bind(self: Parsed, comptime T: type, options, BindOptions) BindError![]T
 /// function. The options will include things related to duplicate handling and
 /// missing fields
-pub const RecordList = struct {
-    list: std.ArrayList(Record),
+pub const Parsed = struct {
+    records: std.ArrayList(Record),
     arena: *std.heap.ArenaAllocator,
 
-    pub fn deinit(self: RecordList) void {
+    pub fn deinit(self: Parsed) void {
         const child_allocator = self.arena.child_allocator;
         self.arena.deinit();
         child_allocator.destroy(self.arena);
     }
-    pub fn format(self: RecordList, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    pub fn format(self: Parsed, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         _ = self;
         _ = writer;
     }
@@ -334,7 +352,7 @@ pub const ParseState = struct {
         try writer.print("line: {}, col: {}", .{ self.line, self.column });
     }
 };
-pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: ParseOptions) ParseError!RecordList {
+pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: ParseOptions) ParseError!Parsed {
     // create an arena allocator for everytyhing related to parsing
     const arena: *std.heap.ArenaAllocator = try allocator.create(std.heap.ArenaAllocator);
     errdefer if (options.diagnostics == null) allocator.destroy(arena);
@@ -352,8 +370,8 @@ pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: Pars
     } else try parseError(aa, options, "Magic header not found on first line", state);
 
     // Loop through the header material and configure our main parsing
-    var parsed: RecordList = .{
-        .list = .empty,
+    var parsed: Parsed = .{
+        .records = .empty,
         .arena = arena,
     };
     const first_data = blk: {
@@ -380,11 +398,7 @@ pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: Pars
     // Main parsing. We already have the first line of data, which could
     // be a record (compact format) or a key/value pair (long format)
     var line: ?[]const u8 = first_data;
-    var items: std.ArrayList(Item) = .empty;
-    errdefer {
-        for (items.items) |i| i.deinit(aa);
-        items.deinit(aa);
-    }
+    var items: std.ArrayList(Field) = .empty;
 
     // Because in long format we don't have newline delimiter, that should really be a noop
     // but we need this for compact format
@@ -425,7 +439,7 @@ pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: Pars
         if (key.len > 0) std.debug.assert(key[0] != delimiter);
         state.column += key.len + 1;
         state.partial_line_column += key.len + 1;
-        const value = try ItemValue.parse(
+        const value = try Value.parse(
             aa,
             it.rest(),
             &state,
@@ -454,16 +468,16 @@ pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: Pars
             const maybe_line = nextLine(reader, &state);
             if (maybe_line == null) {
                 // close out record, return
-                try parsed.list.append(aa, .{
-                    .items = try items.toOwnedSlice(aa),
+                try parsed.records.append(aa, .{
+                    .fields = try items.toOwnedSlice(aa),
                 });
                 break;
             }
             line = maybe_line.?;
             if (line.?.len == 0) {
                 // End of record
-                try parsed.list.append(aa, .{
-                    .items = try items.toOwnedSlice(aa),
+                try parsed.records.append(aa, .{
+                    .fields = try items.toOwnedSlice(aa),
                 });
                 line = nextLine(reader, &state);
             }
@@ -473,8 +487,8 @@ pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: Pars
             state.partial_line_column = 0;
             if (line.?.len == 0) {
                 // close out record
-                try parsed.list.append(aa, .{
-                    .items = try items.toOwnedSlice(aa),
+                try parsed.records.append(aa, .{
+                    .fields = try items.toOwnedSlice(aa),
                 });
                 line = nextLine(reader, &state);
                 state.partial_line_column = 0;
@@ -489,8 +503,8 @@ pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: Pars
     }
     // Parsing complete. Add final record to list. Then, if there are any parse errors, throw
     if (items.items.len > 0)
-        try parsed.list.append(aa, .{
-            .items = try items.toOwnedSlice(aa),
+        try parsed.records.append(aa, .{
+            .fields = try items.toOwnedSlice(aa),
         });
     if (options.diagnostics) |d|
         if (d.errors.items.len > 0) return ParseError.ParseFailed;
@@ -547,9 +561,9 @@ test "long format single record, no eof" {
     var reader = std.Io.Reader.fixed(data);
     const records = try parse(&reader, allocator, .{});
     defer records.deinit();
-    try std.testing.expectEqual(@as(usize, 1), records.list.items.len);
-    try std.testing.expectEqual(@as(usize, 1), records.list.items[0].items.len);
-    const kvps = records.list.items[0].items;
+    try std.testing.expectEqual(@as(usize, 1), records.records.items.len);
+    try std.testing.expectEqual(@as(usize, 1), records.records.items[0].fields.len);
+    const kvps = records.records.items[0].fields;
     try std.testing.expectEqualStrings("key", kvps[0].key);
     try std.testing.expectEqualStrings("string value, with any data except a \\n. an optional string length between the colons", kvps[0].value.?.string);
 }
@@ -569,7 +583,7 @@ test "long format from README - generic data structures, first record only" {
     var reader = std.Io.Reader.fixed(data);
     const records = try parse(&reader, allocator, .{});
     defer records.deinit();
-    try std.testing.expectEqual(@as(usize, 1), records.list.items.len);
+    try std.testing.expectEqual(@as(usize, 1), records.records.items.len);
 }
 
 test "long format from README - generic data structures" {
@@ -601,34 +615,34 @@ test "long format from README - generic data structures" {
     var reader = std.Io.Reader.fixed(data);
     const records = try parse(&reader, allocator, .{});
     defer records.deinit();
-    try std.testing.expectEqual(@as(usize, 2), records.list.items.len);
-    const first = records.list.items[0];
-    try std.testing.expectEqual(@as(usize, 6), first.items.len);
-    try std.testing.expectEqualStrings("key", first.items[0].key);
-    try std.testing.expectEqualStrings("string value, with any data except a \\n. an optional string length between the colons", first.items[0].value.?.string);
-    try std.testing.expectEqualStrings("this is a number", first.items[1].key);
-    try std.testing.expectEqual(@as(f64, 5), first.items[1].value.?.number);
-    try std.testing.expectEqualStrings("null value", first.items[2].key);
-    try std.testing.expect(first.items[2].value == null);
-    try std.testing.expectEqualStrings("array", first.items[3].key);
-    try std.testing.expectEqualStrings("array's don't exist. Use json or toml or something", first.items[3].value.?.string);
-    try std.testing.expectEqualStrings("data with newlines must have a length", first.items[4].key);
-    try std.testing.expectEqualStrings("foo\nbar", first.items[4].value.?.string);
-    try std.testing.expectEqualStrings("boolean value", first.items[5].key);
-    try std.testing.expect(!first.items[5].value.?.boolean);
+    try std.testing.expectEqual(@as(usize, 2), records.records.items.len);
+    const first = records.records.items[0];
+    try std.testing.expectEqual(@as(usize, 6), first.fields.len);
+    try std.testing.expectEqualStrings("key", first.fields[0].key);
+    try std.testing.expectEqualStrings("string value, with any data except a \\n. an optional string length between the colons", first.fields[0].value.?.string);
+    try std.testing.expectEqualStrings("this is a number", first.fields[1].key);
+    try std.testing.expectEqual(@as(f64, 5), first.fields[1].value.?.number);
+    try std.testing.expectEqualStrings("null value", first.fields[2].key);
+    try std.testing.expect(first.fields[2].value == null);
+    try std.testing.expectEqualStrings("array", first.fields[3].key);
+    try std.testing.expectEqualStrings("array's don't exist. Use json or toml or something", first.fields[3].value.?.string);
+    try std.testing.expectEqualStrings("data with newlines must have a length", first.fields[4].key);
+    try std.testing.expectEqualStrings("foo\nbar", first.fields[4].value.?.string);
+    try std.testing.expectEqualStrings("boolean value", first.fields[5].key);
+    try std.testing.expect(!first.fields[5].value.?.boolean);
 
-    const second = records.list.items[1];
-    try std.testing.expectEqual(@as(usize, 5), second.items.len);
-    try std.testing.expectEqualStrings("key", second.items[0].key);
-    try std.testing.expectEqualStrings("this is the second record", second.items[0].value.?.string);
-    try std.testing.expectEqualStrings("this is a number", second.items[1].key);
-    try std.testing.expectEqual(@as(f64, 42), second.items[1].value.?.number);
-    try std.testing.expectEqualStrings("null value", second.items[2].key);
-    try std.testing.expect(second.items[2].value == null);
-    try std.testing.expectEqualStrings("array", second.items[3].key);
-    try std.testing.expectEqualStrings("array's still don't exist", second.items[3].value.?.string);
-    try std.testing.expectEqualStrings("data with newlines must have a length", second.items[4].key);
-    try std.testing.expectEqualStrings("single line", second.items[4].value.?.string);
+    const second = records.records.items[1];
+    try std.testing.expectEqual(@as(usize, 5), second.fields.len);
+    try std.testing.expectEqualStrings("key", second.fields[0].key);
+    try std.testing.expectEqualStrings("this is the second record", second.fields[0].value.?.string);
+    try std.testing.expectEqualStrings("this is a number", second.fields[1].key);
+    try std.testing.expectEqual(@as(f64, 42), second.fields[1].value.?.number);
+    try std.testing.expectEqualStrings("null value", second.fields[2].key);
+    try std.testing.expect(second.fields[2].value == null);
+    try std.testing.expectEqualStrings("array", second.fields[3].key);
+    try std.testing.expectEqualStrings("array's still don't exist", second.fields[3].value.?.string);
+    try std.testing.expectEqualStrings("data with newlines must have a length", second.fields[4].key);
+    try std.testing.expectEqualStrings("single line", second.fields[4].value.?.string);
 }
 
 test "compact format from README - generic data structures" {
@@ -644,24 +658,24 @@ test "compact format from README - generic data structures" {
     // We want "parse" and "parseLeaky" probably. Second parameter is a diagnostics
     const records = try parse(&reader, allocator, .{});
     defer records.deinit();
-    try std.testing.expectEqual(@as(usize, 2), records.list.items.len);
-    const first = records.list.items[0];
-    try std.testing.expectEqual(@as(usize, 6), first.items.len);
-    try std.testing.expectEqualStrings("key", first.items[0].key);
-    try std.testing.expectEqualStrings("string value must have a length between colons or end with a comma", first.items[0].value.?.string);
-    try std.testing.expectEqualStrings("this is a number", first.items[1].key);
-    try std.testing.expectEqual(@as(f64, 5), first.items[1].value.?.number);
-    try std.testing.expectEqualStrings("null value", first.items[2].key);
-    try std.testing.expect(first.items[2].value == null);
-    try std.testing.expectEqualStrings("array", first.items[3].key);
-    try std.testing.expectEqualStrings("array's don't exist. Use json or toml or something", first.items[3].value.?.string);
-    try std.testing.expectEqualStrings("data with newlines must have a length", first.items[4].key);
-    try std.testing.expectEqualStrings("foo\nbar", first.items[4].value.?.string);
-    try std.testing.expectEqualStrings("boolean value", first.items[5].key);
-    try std.testing.expect(!first.items[5].value.?.boolean);
+    try std.testing.expectEqual(@as(usize, 2), records.records.items.len);
+    const first = records.records.items[0];
+    try std.testing.expectEqual(@as(usize, 6), first.fields.len);
+    try std.testing.expectEqualStrings("key", first.fields[0].key);
+    try std.testing.expectEqualStrings("string value must have a length between colons or end with a comma", first.fields[0].value.?.string);
+    try std.testing.expectEqualStrings("this is a number", first.fields[1].key);
+    try std.testing.expectEqual(@as(f64, 5), first.fields[1].value.?.number);
+    try std.testing.expectEqualStrings("null value", first.fields[2].key);
+    try std.testing.expect(first.fields[2].value == null);
+    try std.testing.expectEqualStrings("array", first.fields[3].key);
+    try std.testing.expectEqualStrings("array's don't exist. Use json or toml or something", first.fields[3].value.?.string);
+    try std.testing.expectEqualStrings("data with newlines must have a length", first.fields[4].key);
+    try std.testing.expectEqualStrings("foo\nbar", first.fields[4].value.?.string);
+    try std.testing.expectEqualStrings("boolean value", first.fields[5].key);
+    try std.testing.expect(!first.fields[5].value.?.boolean);
 
-    const second = records.list.items[1];
-    try std.testing.expectEqual(@as(usize, 1), second.items.len);
-    try std.testing.expectEqualStrings("key", second.items[0].key);
-    try std.testing.expectEqualStrings("this is the second record", second.items[0].value.?.string);
+    const second = records.records.items[1];
+    try std.testing.expectEqual(@as(usize, 1), second.fields.len);
+    try std.testing.expectEqualStrings("key", second.fields[0].key);
+    try std.testing.expectEqualStrings("this is the second record", second.fields[0].value.?.string);
 }
