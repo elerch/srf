@@ -78,14 +78,14 @@ pub const Value = union(enum) {
 
     boolean: bool,
 
-    pub fn format(self: Value, writer: *std.Io.Writer) std.Io.Writer.Error!void {
-        switch (self) {
-            .number => try writer.print("num: {d}", .{self.number}),
-            .bytes => try writer.print("bytes: {x}", .{self.bytes}),
-            .string => try writer.print("string: {s}", .{self.string}),
-            .boolean => try writer.print("boolean: {}", .{self.boolean}),
-        }
-    }
+    // pub fn format(self: Value, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    //     switch (self) {
+    //         .number => try writer.print("num: {d}", .{self.number}),
+    //         .bytes => try writer.print("bytes: {x}", .{self.bytes}),
+    //         .string => try writer.print("string: {s}", .{self.string}),
+    //         .boolean => try writer.print("boolean: {}", .{self.boolean}),
+    //     }
+    // }
     pub fn parse(allocator: std.mem.Allocator, str: []const u8, state: *ParseState, delimiter: u8, options: ParseOptions) ParseError!ValueWithMetaData {
         const type_val_sep_raw = std.mem.indexOfScalar(u8, str, ':');
         if (type_val_sep_raw == null) {
@@ -272,7 +272,11 @@ pub const Field = struct {
 // and when you coerce to zig struct have an array .arr that gets populated
 // with strings "foo" and "bar".
 pub const Record = struct {
-    fields: []Field,
+    fields: []const Field,
+
+    pub fn fmt(value: Record, options: FormatOptions) RecordFormatter {
+        return .{ .value = value, .options = options };
+    }
 };
 
 /// The Parsed struct is equivalent to Parsed(T) in std.json. Since most are
@@ -340,6 +344,85 @@ const Directive = union(enum) {
         if (std.mem.eql(u8, "compact", line)) return .compact_format;
         if (std.mem.eql(u8, "long", line)) return .long_format;
         return null;
+    }
+};
+pub const FormatOptions = struct {
+    long_format: bool = false,
+
+    /// Will emit the eof directive as well as requireeof
+    emit_eof: bool = true,
+};
+
+/// Returns a formatter that formats the given value
+pub fn fmt(value: []const Record, options: FormatOptions) Formatter {
+    return Formatter{ .value = value, .options = options };
+}
+test fmt {
+    const records: []const Record = &.{
+        .{ .fields = &.{.{ .key = "foo", .value = .{ .string = "bar" } }} },
+    };
+    var buf: [1024]u8 = undefined;
+    const formatted = try std.fmt.bufPrint(
+        &buf,
+        "{f}",
+        .{fmt(records, .{ .long_format = true })},
+    );
+    try std.testing.expectEqualStrings(
+        \\#!srfv1
+        \\#!long
+        \\foo::bar
+        \\
+    , formatted);
+}
+pub const Formatter = struct {
+    value: []const Record,
+    options: FormatOptions,
+
+    pub fn format(self: Formatter, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        try writer.writeAll("#!srfv1\n");
+        if (self.options.long_format)
+            try writer.writeAll("#!long\n");
+        if (self.options.emit_eof)
+            try writer.writeAll("#!requireeof\n");
+        var first = true;
+        for (self.value) |record| {
+            if (!first and self.options.long_format) try writer.writeByte('\n');
+            first = false;
+            try writer.print("{f}\n", .{Record.fmt(record, self.options)});
+        }
+        if (self.options.emit_eof)
+            try writer.writeAll("#!eof\n");
+    }
+};
+pub const RecordFormatter = struct {
+    value: Record,
+    options: FormatOptions,
+
+    pub fn format(self: RecordFormatter, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        for (self.value.fields, 0..) |f, i| {
+            try writer.writeAll(f.key);
+            if (f.value == null) {
+                try writer.writeAll(":null:");
+            } else {
+                try writer.writeByte(':');
+                switch (f.value.?) {
+                    .string => |s| {
+                        const newlines = std.mem.containsAtLeastScalar(u8, s, 1, '\n');
+                        // Output the count if newlines exist
+                        const count = if (newlines) s.len else null;
+                        if (count) |c| try writer.print("{d}", .{c});
+                        try writer.writeByte(':');
+                        try writer.writeAll(s);
+                    },
+                    .number => |n| try writer.print("num:{d}", .{n}),
+                    .boolean => |b| try writer.print("bool:{}", .{b}),
+                    .bytes => |b| try writer.print("binary:{b64}", .{b}),
+                }
+            }
+            const delimiter: u8 = if (self.options.long_format) '\n' else ',';
+            if (i < self.value.fields.len - 1)
+                try writer.writeByte(delimiter);
+        }
     }
 };
 pub const ParseState = struct {
@@ -678,4 +761,63 @@ test "compact format from README - generic data structures" {
     try std.testing.expectEqual(@as(usize, 1), second.fields.len);
     try std.testing.expectEqualStrings("key", second.fields[0].key);
     try std.testing.expectEqualStrings("this is the second record", second.fields[0].value.?.string);
+}
+test "format all the things" {
+    const records: []const Record = &.{
+        .{ .fields = &.{
+            .{ .key = "foo", .value = .{ .string = "bar" } },
+            .{ .key = "foo", .value = null },
+            .{ .key = "foo", .value = .{ .bytes = "bar" } },
+            .{ .key = "foo", .value = .{ .number = 42 } },
+        } },
+        .{ .fields = &.{
+            .{ .key = "foo", .value = .{ .string = "bar" } },
+            .{ .key = "foo", .value = null },
+            .{ .key = "foo", .value = .{ .bytes = "bar" } },
+            .{ .key = "foo", .value = .{ .number = 42 } },
+        } },
+    };
+    var buf: [1024]u8 = undefined;
+    const formatted = try std.fmt.bufPrint(
+        &buf,
+        "{f}",
+        .{fmt(records, .{ .long_format = true })},
+    );
+    try std.testing.expectEqualStrings(
+        \\#!srfv1
+        \\#!long
+        \\foo::bar
+        \\foo:null:
+        \\foo:binary:YmFy
+        \\foo:num:42
+        \\
+        \\foo::bar
+        \\foo:null:
+        \\foo:binary:YmFy
+        \\foo:num:42
+        \\
+    , formatted);
+
+    // Round trip and make sure we get equivalent objects back
+    var formatted_reader = std.Io.Reader.fixed(formatted);
+    const parsed = try parse(&formatted_reader, std.testing.allocator, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualDeep(records, parsed.records.items);
+
+    const compact = try std.fmt.bufPrint(
+        &buf,
+        "{f}",
+        .{fmt(records, .{})},
+    );
+    try std.testing.expectEqualStrings(
+        \\#!srfv1
+        \\foo::bar,foo:null:,foo:binary:YmFy,foo:num:42
+        \\foo::bar,foo:null:,foo:binary:YmFy,foo:num:42
+        \\
+    , compact);
+    // Round trip and make sure we get equivalent objects back
+    var compact_reader = std.Io.Reader.fixed(compact);
+    const parsed_compact = try parse(&compact_reader, std.testing.allocator, .{});
+    defer parsed_compact.deinit();
+    try std.testing.expectEqualDeep(records, parsed_compact.records.items);
 }
