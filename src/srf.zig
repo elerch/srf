@@ -350,7 +350,7 @@ pub const FormatOptions = struct {
     long_format: bool = false,
 
     /// Will emit the eof directive as well as requireeof
-    emit_eof: bool = true,
+    emit_eof: bool = false,
 };
 
 /// Returns a formatter that formats the given value
@@ -658,7 +658,7 @@ test "long format from README - generic data structures, first record only" {
         \\# A comment
         \\# empty lines ignored
         \\
-        \\this is a number:num: 5 
+        \\this is a number:num: 5
         \\#!eof
     ;
 
@@ -678,7 +678,7 @@ test "long format from README - generic data structures" {
         \\# empty lines ignored
         \\
         \\key::string value, with any data except a \n. an optional string length between the colons
-        \\this is a number:num: 5 
+        \\this is a number:num: 5
         \\null value:null:
         \\array::array's don't exist. Use json or toml or something
         \\data with newlines must have a length:7:foo
@@ -687,7 +687,7 @@ test "long format from README - generic data structures" {
         \\  # Empty line separates records
         \\
         \\key::this is the second record
-        \\this is a number:num:42 
+        \\this is a number:num:42
         \\null value:null:
         \\array::array's still don't exist
         \\data with newlines must have a length::single line
@@ -778,6 +778,28 @@ test "format all the things" {
         } },
     };
     var buf: [1024]u8 = undefined;
+    const formatted_eof = try std.fmt.bufPrint(
+        &buf,
+        "{f}",
+        .{fmt(records, .{ .long_format = true, .emit_eof = true })},
+    );
+    try std.testing.expectEqualStrings(
+        \\#!srfv1
+        \\#!long
+        \\#!requireeof
+        \\foo::bar
+        \\foo:null:
+        \\foo:binary:YmFy
+        \\foo:num:42
+        \\
+        \\foo::bar
+        \\foo:null:
+        \\foo:binary:YmFy
+        \\foo:num:42
+        \\#!eof
+        \\
+    , formatted_eof);
+
     const formatted = try std.fmt.bufPrint(
         &buf,
         "{f}",
