@@ -87,6 +87,8 @@ pub const Value = union(enum) {
     //     }
     // }
     pub fn parse(allocator: std.mem.Allocator, str: []const u8, state: *ParseState, delimiter: u8, options: ParseOptions) ParseError!ValueWithMetaData {
+        const debug = str.len > 2 and str[0] == '1' and str[1] == '1';
+        if (debug) log.debug("parsing {s}", .{str});
         const type_val_sep_raw = std.mem.indexOfScalar(u8, str, ':');
         if (type_val_sep_raw == null) {
             try parseError(allocator, options, "no type data or value after key", state.*);
@@ -144,7 +146,7 @@ pub const Value = union(enum) {
             const val = it.first();
             // we need to advance the column/partial_line_column of our parsing state
             const total_chars = metadata.len + 1 + val.len;
-            log.debug("num total_chars: {d}", .{total_chars});
+            // log.debug("num total_chars: {d}", .{total_chars});
             state.column += total_chars;
             state.partial_line_column += total_chars;
             const val_trimmed = std.mem.trim(u8, val, &std.ascii.whitespace);
@@ -204,18 +206,21 @@ pub const Value = union(enum) {
                 .error_parsing = true,
             };
         };
+        if (debug) log.debug("found fixed string size {d}. State {f}", .{ size, state });
         // Update again for number of bytes. All failures beyond this point are
         // fatal, so this is safe.
         state.column += size;
         state.partial_line_column += size;
+        if (debug) log.debug("New state {f}", .{state});
 
         // If we are being asked specifically for bytes, we no longer care about
         // delimiters. We just want raw bytes. This might adjust our line/column
         // in the parse state
         const rest_of_data = str[type_val_sep + 1 ..];
-        if (rest_of_data.len > size) {
+        if (rest_of_data.len >= size) {
             // We fit on this line, everything is "normal"
             const val = rest_of_data[0..size];
+            if (debug) log.debug("val {s}", .{val});
             return .{
                 .item_value = .{ .string = val },
             };
@@ -842,4 +847,25 @@ test "format all the things" {
     const parsed_compact = try parse(&compact_reader, std.testing.allocator, .{});
     defer parsed_compact.deinit();
     try std.testing.expectEqualDeep(records, parsed_compact.records.items);
+}
+test "compact format length-prefixed string as last field" {
+    // When a length-prefixed value is the last field on the line,
+    // rest_of_data.len == size exactly. The check on line 216 uses
+    // strict > instead of >=, falling through to the multi-line path
+    // where size - rest_of_data.len - 1 underflows.
+    const data =
+        \\#!srfv1
+        \\name::alice,desc:5:world
+    ;
+    const allocator = std.testing.allocator;
+    var reader = std.Io.Reader.fixed(data);
+    const records = try parse(&reader, allocator, .{});
+    defer records.deinit();
+    try std.testing.expectEqual(@as(usize, 1), records.records.items.len);
+    const rec = records.records.items[0];
+    try std.testing.expectEqual(@as(usize, 2), rec.fields.len);
+    try std.testing.expectEqualStrings("name", rec.fields[0].key);
+    try std.testing.expectEqualStrings("alice", rec.fields[0].value.?.string);
+    try std.testing.expectEqualStrings("desc", rec.fields[1].key);
+    try std.testing.expectEqualStrings("world", rec.fields[1].value.?.string);
 }
