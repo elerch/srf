@@ -30,7 +30,7 @@ Long format:
 # empty lines ignored
 
 key::string value, with any data except a \n. an optional string length between the colons
-this is a number:num: 5 
+this is a number:num: 5
 null value:null:
 array::array's don't exist. Use json or toml or something
 data with newlines must have a length:7:foo
@@ -39,7 +39,7 @@ boolean value:bool:false
 
   # Empty line separates records, but comments don't count as empty
 key::this is the second record
-this is a number:num:42 
+this is a number:num:42
 null value:null:
 array::array's still don't exist
 data with newlines must have a length::single line
@@ -84,3 +84,8 @@ key::this is the second record
 **Error handling:**
 - Clear error types needed for different parse failure modes
 - Distinguish between format errors, data errors, and I/O errors
+
+## AI Use
+
+AI was used in this project for comments, parts of the README, and unit test
+generation. All other code is human generated.

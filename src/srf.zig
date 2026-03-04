@@ -282,6 +282,90 @@ pub const Record = struct {
     pub fn fmt(value: Record, options: FormatOptions) RecordFormatter {
         return .{ .value = value, .options = options };
     }
+
+    pub fn firstFieldByName(self: Record, field_name: []const u8) ?Field {
+        for (self.fields) |f|
+            if (std.mem.eql(u8, f.key, field_name)) return f;
+        return null;
+    }
+
+    fn coerce(name: []const u8, comptime T: type, val: ?Value) !T {
+        // Here's the deduplicated set of field types that coerce needs to handle:
+        // Direct from SRF values:
+        // Need parsing from string:
+        // - Date, ?Date -- Date.parse(string)
+        //
+        // Won't work with Record.to(T) generically:
+        // - []const OptionContract -- nested sub-records (OptionsChain has calls/puts arrays)
+        // - ?[]const Holding, ?[]const SectorWeight -- nested sub-records in EtfProfile
+        //
+        const ti = @typeInfo(T);
+        if (val == null and ti != .optional)
+            return error.NullValueCannotBeAssignedToNonNullField;
+
+        // []const u8 is classified as a pointer
+        switch (ti) {
+            .optional => |o| if (val) |_|
+                return try coerce(name, o.child, val)
+            else
+                return null,
+            .pointer => |p| {
+                // We don't have an allocator, so the only thing we can do
+                // here is manage []const u8 or []u8
+                if (p.size != .slice or p.child != u8)
+                    return error.CoercionNotPossible;
+                if (val.? != .string and val.? != .bytes)
+                    return error.CoercionNotPossible;
+                if (val.? == .string)
+                    return val.?.string;
+                return val.?.bytes;
+            },
+            .type, .void, .noreturn => return error.CoercionNotPossible,
+            .comptime_float, .comptime_int, .undefined, .null, .error_union => return error.CoercionNotPossible,
+            .error_set, .@"fn", .@"opaque", .frame => return error.CoercionNotPossible,
+            .@"anyframe", .vector, .enum_literal => return error.CoercionNotPossible,
+            .int => return @as(T, @intFromFloat(val.?.number)),
+            .float => return @as(T, @floatCast(val.?.number)),
+            .bool => return val.?.boolean,
+            .@"enum" => return std.meta.stringToEnum(T, val.?.string).?,
+            .array => return error.NotImplemented,
+            .@"struct", .@"union" => {
+                if (std.meta.hasMethod(T, "srfParse")) {
+                    if (val.? == .string)
+                        return T.srfParse(val.?.string) catch |e| {
+                            log.err(
+                                "custom parse of value {s} failed : {}",
+                                .{ val.?.string, e },
+                            );
+                            return error.CustomParseFailed;
+                        };
+                }
+                return error.CoercionNotPossible;
+            },
+        }
+        return null;
+    }
+    /// Coerce Record to a type. Does not handle fields with arrays
+    pub fn to(self: Record, comptime T: type) !T {
+        // SAFETY: all fields updated below or error is returned
+        var obj: T = undefined;
+        inline for (std.meta.fields(T)) |type_field| {
+            // find the field in the data by field name, set the value
+            // if not found, return an error
+            if (self.firstFieldByName(type_field.name)) |srf_field| {
+                @field(obj, type_field.name) = try coerce(type_field.name, type_field.type, srf_field.value);
+            } else {
+                // No srf_field found...revert to default value
+                if (type_field.default_value_ptr) |ptr| {
+                    @field(obj, type_field.name) = @as(*const type_field.type, @ptrCast(@alignCast(ptr))).*;
+                } else {
+                    log.err("Record could not be coerced. Field {s} not found on srf data, and no default value exists on the type", .{type_field.name});
+                    return error.FieldNotFoundOnFieldWithoutDefaultValue;
+                }
+            }
+        }
+        return obj;
+    }
 };
 
 /// The Parsed struct is equivalent to Parsed(T) in std.json. Since most are
@@ -305,6 +389,10 @@ pub const Record = struct {
 pub const Parsed = struct {
     records: std.ArrayList(Record),
     arena: *std.heap.ArenaAllocator,
+    /// optional expiry time for the data. Useful for caching
+    /// Note that on a parse, data will always be returned and it will be up
+    /// to the caller to check is_fresh and determine the right thing to do
+    expires: ?i64,
 
     pub fn deinit(self: Parsed) void {
         const child_allocator = self.arena.child_allocator;
@@ -314,6 +402,14 @@ pub const Parsed = struct {
     pub fn format(self: Parsed, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         _ = self;
         _ = writer;
+    }
+
+    pub fn is_fresh(self: Parsed) bool {
+        if (self.expires) |exp|
+            return std.time.timestamp > exp;
+
+        // no expiry: always fresh, never frozen
+        return true;
     }
 };
 
@@ -333,6 +429,7 @@ const Directive = union(enum) {
     compact_format,
     require_eof,
     eof,
+    expires: i64,
 
     pub fn parse(allocator: std.mem.Allocator, str: []const u8, state: ParseState, options: ParseOptions) ParseError!?Directive {
         if (!std.mem.startsWith(u8, str, "#!")) return null;
@@ -348,6 +445,11 @@ const Directive = union(enum) {
         if (std.mem.eql(u8, "eof", line)) return .eof;
         if (std.mem.eql(u8, "compact", line)) return .compact_format;
         if (std.mem.eql(u8, "long", line)) return .long_format;
+        if (std.mem.startsWith(u8, line, "expires=")) {
+            return .{ .expires = std.fmt.parseInt(i64, line["expires=".len..], 10) catch return ParseError.ParseFailed };
+            // try parseError(allocator, options, "#!requireof found. Did you mean #!requireeof?", state);
+            // return null;
+        }
         return null;
     }
 };
@@ -356,6 +458,9 @@ pub const FormatOptions = struct {
 
     /// Will emit the eof directive as well as requireeof
     emit_eof: bool = false,
+
+    /// Specify an expiration time for the data being written
+    expires: ?i64 = null,
 };
 
 /// Returns a formatter that formats the given value
@@ -389,6 +494,8 @@ pub const Formatter = struct {
             try writer.writeAll("#!long\n");
         if (self.options.emit_eof)
             try writer.writeAll("#!requireeof\n");
+        if (self.options.expires) |e|
+            try writer.print("#!expires={d}\n", .{e});
         var first = true;
         for (self.value) |record| {
             if (!first and self.options.long_format) try writer.writeByte('\n');
@@ -461,6 +568,7 @@ pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: Pars
     var parsed: Parsed = .{
         .records = .empty,
         .arena = arena,
+        .expires = null,
     };
     const first_data = blk: {
         while (nextLine(reader, &state)) |line| {
@@ -470,6 +578,7 @@ pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: Pars
                     .long_format => long_format = true,
                     .compact_format => long_format = false, // what if we have both?
                     .require_eof => require_eof = true,
+                    .expires => |exp| parsed.expires = exp,
                     .eof => {
                         // there needs to be an eof then
                         if (nextLine(reader, &state)) |_| {
@@ -847,6 +956,79 @@ test "format all the things" {
     const parsed_compact = try parse(&compact_reader, std.testing.allocator, .{});
     defer parsed_compact.deinit();
     try std.testing.expectEqualDeep(records, parsed_compact.records.items);
+
+    const expected_expires: i64 = 1772589213;
+    const compact_expires = try std.fmt.bufPrint(
+        &buf,
+        "{f}",
+        .{fmt(records, .{ .expires = expected_expires })},
+    );
+    try std.testing.expectEqualStrings(
+        \\#!srfv1
+        \\#!expires=1772589213
+        \\foo::bar,foo:null:,foo:binary:YmFy,foo:num:42
+        \\foo::bar,foo:null:,foo:binary:YmFy,foo:num:42
+        \\
+    , compact_expires);
+    // Round trip and make sure we get equivalent objects back
+    var expires_reader = std.Io.Reader.fixed(compact_expires);
+    const parsed_expires = try parse(&expires_reader, std.testing.allocator, .{});
+    defer parsed_expires.deinit();
+    try std.testing.expectEqualDeep(records, parsed_expires.records.items);
+    try std.testing.expectEqual(expected_expires, parsed_expires.expires.?);
+}
+test "serialize/deserialize" {
+    const RecType = enum {
+        foo,
+        bar,
+    };
+
+    const Custom = struct {
+        const Self = @This();
+        pub fn srfParse(val: []const u8) !Self {
+            if (std.mem.eql(u8, "hi", val)) return .{};
+            return error.ValueNotEqualHi;
+        }
+    };
+
+    const Data = struct {
+        foo: []const u8,
+        bar: u8,
+        qux: ?RecType = .foo,
+        b: bool = false,
+        f: f32 = 4.2,
+        custom: ?Custom = null,
+    };
+
+    // var buf: [4096]u8 = undefined;
+    // const compact = try std.fmt.bufPrint(
+    //     &buf,
+    //     "{f}",
+    //     .{fmt(records, .{})},
+    // );
+    const compact =
+        \\#!srfv1
+        \\foo::bar,foo:null:,foo:binary:YmFy,foo:num:42,bar:num:42
+        \\foo::bar,foo:null:,foo:binary:YmFy,foo:num:42,bar:num:42
+        \\foo::bar,foo:null:,foo:binary:YmFy,foo:num:42,bar:num:42,qux::bar
+        \\foo::bar,foo:null:,foo:binary:YmFy,foo:num:42,bar:num:42,qux::bar,b:bool:true,f:num:6.9,custom:string:hi
+        \\
+    ;
+    // Round trip and make sure we get equivalent objects back
+    var compact_reader = std.Io.Reader.fixed(compact);
+    const parsed = try parse(&compact_reader, std.testing.allocator, .{});
+    defer parsed.deinit();
+
+    const rec1 = try parsed.records.items[0].to(Data);
+    try std.testing.expectEqualStrings("bar", rec1.foo);
+    try std.testing.expectEqual(@as(u8, 42), rec1.bar);
+    try std.testing.expectEqual(@as(RecType, .foo), rec1.qux);
+    const rec4 = try parsed.records.items[3].to(Data);
+    try std.testing.expectEqualStrings("bar", rec4.foo);
+    try std.testing.expectEqual(@as(u8, 42), rec4.bar);
+    try std.testing.expectEqual(@as(RecType, .bar), rec4.qux.?);
+    try std.testing.expectEqual(true, rec4.b);
+    try std.testing.expectEqual(@as(f32, 6.9), rec4.f);
 }
 test "compact format length-prefixed string as last field" {
     // When a length-prefixed value is the last field on the line,
