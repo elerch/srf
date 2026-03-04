@@ -345,6 +345,145 @@ pub const Record = struct {
         }
         return null;
     }
+
+    fn OwnedRecord(comptime T: type) type {
+        return struct {
+            fields_buf: [fields_len]Field,
+            fields_allocated: [fields_len]bool = .{false} ** fields_len,
+            allocator: std.mem.Allocator,
+            source_value: T,
+            cached_record: ?Record = null,
+
+            const Self = @This();
+            const fields_len = std.meta.fields(T).len;
+
+            pub const SourceType = T;
+
+            pub fn init(allocator: std.mem.Allocator, source: T) Self {
+                return .{
+                    // SAFETY: fields_buf is set by record() and is guarded by fields_set
+                    .fields_buf = undefined,
+                    .allocator = allocator,
+                    .source_value = source,
+                };
+            }
+
+            const FormatResult = struct {
+                value: ?Value,
+                allocated: bool = false,
+            };
+            fn setField(
+                self: *Self,
+                inx: usize,
+                comptime field_name: []const u8,
+                comptime field_type: type,
+                comptime default_value_ptr: ?*const anyopaque,
+            ) !usize {
+                const val = @field(self.source_value, field_name);
+                if (default_value_ptr) |d| {
+                    const default_val: *const field_type = @ptrCast(@alignCast(d));
+                    if (std.meta.eql(val, default_val.*)) return inx;
+                }
+                const value = try self.formatField(field_type, field_name, val);
+                self.fields_buf[inx] = .{
+                    .key = field_name,
+                    .value = value.value,
+                };
+                self.fields_allocated[inx] = value.allocated;
+                return inx + 1;
+            }
+            fn formatField(self: Self, comptime field_type: type, comptime field_name: []const u8, val: anytype) !FormatResult {
+                const ti = @typeInfo(field_type);
+                switch (ti) {
+                    .optional => |o| {
+                        if (val) |v|
+                            return self.formatField(o.child, field_name, v);
+                        return .{ .value = null };
+                    },
+                    .pointer => |p| {
+                        // We don't have an allocator, so the only thing we can do
+                        // here is manage []const u8 or []u8
+                        if (p.size != .slice or p.child != u8)
+                            return error.CoercionNotPossible;
+                        return .{ .value = .{ .string = val } };
+                    },
+                    .type, .void, .noreturn => return error.CoercionNotPossible,
+                    .comptime_float, .comptime_int, .undefined, .null, .error_union => return error.CoercionNotPossible,
+                    .error_set, .@"fn", .@"opaque", .frame => return error.CoercionNotPossible,
+                    .@"anyframe", .vector, .enum_literal => return error.CoercionNotPossible,
+                    .int => return .{ .value = .{ .number = @floatFromInt(val) } },
+                    .float => return .{ .value = .{ .number = @floatCast(val) } },
+                    .bool => return .{ .value = .{ .boolean = val } },
+                    .@"enum" => return .{ .value = .{ .string = @tagName(val) } },
+                    .array => return error.NotImplemented,
+                    .@"struct", .@"union" => {
+                        if (std.meta.hasMethod(field_type, "srfFormat")) {
+                            return .{
+                                .value = field_type.srfFormat(self.allocator, field_name) catch |e| {
+                                    log.err(
+                                        "custom format of field {s} failed : {}",
+                                        .{ field_name, e },
+                                    );
+                                    return error.CustomFormatFailed;
+                                },
+                                .allocated = true,
+                            };
+                        }
+                        return error.CoercionNotPossible;
+                    },
+                }
+            }
+            pub fn record(self: *Self) !Record {
+                if (self.cached_record) |r| return r;
+                var inx: usize = 0;
+                const ti = @typeInfo(SourceType);
+                switch (ti) {
+                    .@"struct" => |info| {
+                        inline for (info.fields) |f|
+                            inx = try self.setField(inx, f.name, f.type, f.default_value_ptr);
+                    },
+                    .@"union" => |info| {
+                        inline for (info.fields) |f|
+                            inx = try self.setField(inx, f.name, f.type, null);
+                    },
+                    .@"enum" => |info| {
+                        inline for (info.fields) |f|
+                            inx = try self.setField(inx, f.name, self.SourceType, null);
+                    },
+                    .error_set => return error.ErrorSetNotSupported,
+                    else => @compileError("Expected struct, union, error set or enum type, found '" ++ @typeName(T) ++ "'"),
+                }
+                self.cached_record = .{ .fields = self.fields_buf[0..inx] };
+                return self.cached_record.?;
+            }
+            pub fn deinit(self: *Self) void {
+                for (0..fields_len) |i| {
+                    if (self.fields_allocated[i]) {
+                        if (self.fields_buf[i].value) |v| switch (v) {
+                            .string => |s| self.allocator.free(s),
+                            .bytes => |b| self.allocator.free(b),
+                            else => {},
+                        };
+                    }
+                }
+            }
+        };
+    }
+    /// Create an OwnedRecord from a Zig struct value. Fields are mapped by name:
+    /// string/optional string fields become string Values, numeric fields become
+    /// number Values, bools become boolean Values, and enums are converted via
+    /// @tagName. Struct/union fields with a `srfFormat` method use that for
+    /// custom serialization (allocated via the provided allocator).
+    ///
+    /// The returned OwnedRecord borrows string data from `val` for any
+    /// []const u8 fields. The caller must ensure `val` (and any data it
+    /// references) outlives the OwnedRecord.
+    ///
+    /// Call `deinit()` to free any allocations made for custom-formatted fields.
+    pub fn from(comptime T: type, allocator: std.mem.Allocator, val: T) !OwnedRecord(T) {
+        return OwnedRecord(T).init(allocator, val);
+    }
+
     /// Coerce Record to a type. Does not handle fields with arrays
     pub fn to(self: Record, comptime T: type) !T {
         // SAFETY: all fields updated below or error is returned
@@ -989,6 +1128,12 @@ test "serialize/deserialize" {
             if (std.mem.eql(u8, "hi", val)) return .{};
             return error.ValueNotEqualHi;
         }
+        pub fn srfFormat(allocator: std.mem.Allocator, comptime field_name: []const u8) !Value {
+            _ = field_name;
+            return .{
+                .string = try allocator.dupe(u8, "hi"),
+            };
+        }
     };
 
     const Data = struct {
@@ -1029,6 +1174,39 @@ test "serialize/deserialize" {
     try std.testing.expectEqual(@as(RecType, .bar), rec4.qux.?);
     try std.testing.expectEqual(true, rec4.b);
     try std.testing.expectEqual(@as(f32, 6.9), rec4.f);
+    // const expect =
+    //     \\#!srfv1
+    //     \\foo::bar,bar:num:42
+    //     \\foo::bar,bar:num:42
+    //     \\foo::bar,bar:num:42,qux::bar
+    //     \\foo::bar,bar:num:42,qux::bar,b:bool:true,f:num:6.9,custom:string:hi
+    //     \\
+    // ;
+    const alloc = std.testing.allocator;
+    var owned_record_1 = try Record.from(Data, alloc, rec1);
+    defer owned_record_1.deinit();
+    const record_1 = try owned_record_1.record();
+    try std.testing.expectEqual(@as(usize, 2), record_1.fields.len);
+    var owned_record_4 = try Record.from(Data, alloc, rec4);
+    defer owned_record_4.deinit();
+    try std.testing.expectEqual(std.meta.fields(Data).len, owned_record_4.fields_buf.len);
+    const record_4 = try owned_record_4.record();
+    // const Data = struct {
+    //     foo: []const u8,
+    //     bar: u8,
+    //     qux: ?RecType = .foo,
+    //     b: bool = false,
+    //     f: f32 = 4.2,
+    //     custom: ?Custom = null,
+    // };
+    try std.testing.expectEqual(@as(usize, 6), record_4.fields.len);
+
+    // var buf: [4096]u8 = undefined;
+    // const round_trip = try std.fmt.bufPrint(
+    //     &buf,
+    //     "{f}",
+    //     .{fmt(records, .{})},
+    // );
 }
 test "compact format length-prefixed string as last field" {
     // When a length-prefixed value is the last field on the line,
