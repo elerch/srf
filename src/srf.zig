@@ -406,7 +406,7 @@ pub const Parsed = struct {
 
     pub fn is_fresh(self: Parsed) bool {
         if (self.expires) |exp|
-            return std.time.timestamp > exp;
+            return std.time.timestamp() < exp;
 
         // no expiry: always fresh, never frozen
         return true;
