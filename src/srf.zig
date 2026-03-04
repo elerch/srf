@@ -359,7 +359,7 @@ pub const Record = struct {
                 if (type_field.default_value_ptr) |ptr| {
                     @field(obj, type_field.name) = @as(*const type_field.type, @ptrCast(@alignCast(ptr))).*;
                 } else {
-                    log.err("Record could not be coerced. Field {s} not found on srf data, and no default value exists on the type", .{type_field.name});
+                    log.debug("Record could not be coerced. Field {s} not found on srf data, and no default value exists on the type", .{type_field.name});
                     return error.FieldNotFoundOnFieldWithoutDefaultValue;
                 }
             }
