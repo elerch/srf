@@ -604,7 +604,38 @@ pub const FormatOptions = struct {
 
 /// Returns a formatter that formats the given value
 pub fn fmt(value: []const Record, options: FormatOptions) Formatter {
-    return Formatter{ .value = value, .options = options };
+    return .{ .value = value, .options = options };
+}
+/// Returns a formatter that formats the given value. This will take a concrete
+/// type, convert it to the SRF record format automatically (using srfFormat if
+/// found), and output to the writer. It is recommended to use a FixedBufferAllocator
+/// for the allocator, which is only used for custom srfFormat functions (I think - what about enum tag names?)
+pub fn fmtFrom(comptime T: type, allocator: std.mem.Allocator, value: []const T, options: FormatOptions) FromFormatter(T) {
+    return .{ .value = value, .options = options, .allocator = allocator };
+}
+pub fn FromFormatter(comptime T: type) type {
+    return struct {
+        value: []const T,
+        options: FormatOptions,
+        allocator: std.mem.Allocator,
+
+        const Self = @This();
+
+        pub fn format(self: Self, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            try frontMatter(writer, self.options);
+            var first = true;
+            for (self.value) |item| {
+                if (!first and self.options.long_format) try writer.writeByte('\n');
+                first = false;
+                var owned_record = Record.from(T, self.allocator, item) catch
+                    return std.Io.Writer.Error.WriteFailed;
+                defer owned_record.deinit();
+                const record = owned_record.record() catch return std.Io.Writer.Error.WriteFailed;
+                try writer.print("{f}\n", .{Record.fmt(record, self.options)});
+            }
+            try epilogue(writer, self.options);
+        }
+    };
 }
 test fmt {
     const records: []const Record = &.{
@@ -623,26 +654,33 @@ test fmt {
         \\
     , formatted);
 }
+fn frontMatter(writer: *std.Io.Writer, options: FormatOptions) !void {
+    try writer.writeAll("#!srfv1\n");
+    if (options.long_format)
+        try writer.writeAll("#!long\n");
+    if (options.emit_eof)
+        try writer.writeAll("#!requireeof\n");
+    if (options.expires) |e|
+        try writer.print("#!expires={d}\n", .{e});
+}
+fn epilogue(writer: *std.Io.Writer, options: FormatOptions) !void {
+    if (options.emit_eof)
+        try writer.writeAll("#!eof\n");
+}
+
 pub const Formatter = struct {
     value: []const Record,
     options: FormatOptions,
 
     pub fn format(self: Formatter, writer: *std.Io.Writer) std.Io.Writer.Error!void {
-        try writer.writeAll("#!srfv1\n");
-        if (self.options.long_format)
-            try writer.writeAll("#!long\n");
-        if (self.options.emit_eof)
-            try writer.writeAll("#!requireeof\n");
-        if (self.options.expires) |e|
-            try writer.print("#!expires={d}\n", .{e});
+        try frontMatter(writer, self.options);
         var first = true;
         for (self.value) |record| {
             if (!first and self.options.long_format) try writer.writeByte('\n');
             first = false;
             try writer.print("{f}\n", .{Record.fmt(record, self.options)});
         }
-        if (self.options.emit_eof)
-            try writer.writeAll("#!eof\n");
+        try epilogue(writer, self.options);
     }
 };
 pub const RecordFormatter = struct {
@@ -665,7 +703,7 @@ pub const RecordFormatter = struct {
                         try writer.writeByte(':');
                         try writer.writeAll(s);
                     },
-                    .number => |n| try writer.print("num:{d}", .{n}),
+                    .number => |n| try writer.print("num:{d}", .{@as(f64, @floatCast(n))}),
                     .boolean => |b| try writer.print("bool:{}", .{b}),
                     .bytes => |b| try writer.print("binary:{b64}", .{b}),
                 }
@@ -1145,12 +1183,6 @@ test "serialize/deserialize" {
         custom: ?Custom = null,
     };
 
-    // var buf: [4096]u8 = undefined;
-    // const compact = try std.fmt.bufPrint(
-    //     &buf,
-    //     "{f}",
-    //     .{fmt(records, .{})},
-    // );
     const compact =
         \\#!srfv1
         \\foo::bar,foo:null:,foo:binary:YmFy,foo:num:42,bar:num:42
@@ -1174,14 +1206,7 @@ test "serialize/deserialize" {
     try std.testing.expectEqual(@as(RecType, .bar), rec4.qux.?);
     try std.testing.expectEqual(true, rec4.b);
     try std.testing.expectEqual(@as(f32, 6.9), rec4.f);
-    // const expect =
-    //     \\#!srfv1
-    //     \\foo::bar,bar:num:42
-    //     \\foo::bar,bar:num:42
-    //     \\foo::bar,bar:num:42,qux::bar
-    //     \\foo::bar,bar:num:42,qux::bar,b:bool:true,f:num:6.9,custom:string:hi
-    //     \\
-    // ;
+
     const alloc = std.testing.allocator;
     var owned_record_1 = try Record.from(Data, alloc, rec1);
     defer owned_record_1.deinit();
@@ -1201,12 +1226,24 @@ test "serialize/deserialize" {
     // };
     try std.testing.expectEqual(@as(usize, 6), record_4.fields.len);
 
-    // var buf: [4096]u8 = undefined;
-    // const round_trip = try std.fmt.bufPrint(
-    //     &buf,
-    //     "{f}",
-    //     .{fmt(records, .{})},
-    // );
+    const all_data: []const Data = &.{
+        .{ .foo = "hi", .bar = 42, .qux = .bar, .b = true, .f = 6.0, .custom = .{} },
+        .{ .foo = "bar", .bar = 69 },
+    };
+    var buf: [4096]u8 = undefined;
+    const compact_from = try std.fmt.bufPrint(
+        &buf,
+        "{f}",
+        .{fmtFrom(Data, alloc, all_data, .{})},
+    );
+
+    const expect =
+        \\#!srfv1
+        \\foo::hi,bar:num:42,qux::bar,b:bool:true,f:num:6,custom::hi
+        \\foo::bar,bar:num:69
+        \\
+    ;
+    try std.testing.expectEqualStrings(expect, compact_from);
 }
 test "compact format length-prefixed string as last field" {
     // When a length-prefixed value is the last field on the line,
