@@ -419,7 +419,7 @@ pub const Record = struct {
                     .@"struct", .@"union" => {
                         if (std.meta.hasMethod(field_type, "srfFormat")) {
                             return .{
-                                .value = field_type.srfFormat(self.allocator, field_name) catch |e| {
+                                .value = val.srfFormat(self.allocator, field_name) catch |e| {
                                     log.err(
                                         "custom format of field {s} failed : {}",
                                         .{ field_name, e },
@@ -1166,7 +1166,8 @@ test "serialize/deserialize" {
             if (std.mem.eql(u8, "hi", val)) return .{};
             return error.ValueNotEqualHi;
         }
-        pub fn srfFormat(allocator: std.mem.Allocator, comptime field_name: []const u8) !Value {
+        pub fn srfFormat(self: Self, allocator: std.mem.Allocator, comptime field_name: []const u8) !Value {
+            _ = self;
             _ = field_name;
             return .{
                 .string = try allocator.dupe(u8, "hi"),
