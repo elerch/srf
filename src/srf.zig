@@ -459,13 +459,9 @@ pub const Record = struct {
                             inx = try self.setField(inx, f.name, f.type, f.default_value_ptr, field_val);
                         }
                     },
-                    .@"union" => |info| {
+                    .@"union" => {
                         const active_tag_name = @tagName(val);
-                        comptime var has_decl = false;
-                        inline for (info.decls) |d| {
-                            if (comptime std.mem.eql(u8, "srf_tag_field", d.name)) has_decl = true;
-                        }
-                        const key = if (has_decl)
+                        const key = if (@hasDecl(U, "srf_tag_field"))
                             U.srf_tag_field
                         else
                             "active_tag";
