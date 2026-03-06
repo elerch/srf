@@ -1348,6 +1348,65 @@ test "unions" {
     const rec2 = try parsed.records.items[1].to(MixedData);
     try std.testing.expectEqualDeep(data[1], rec2);
 }
+test "enums" {
+    const Types = enum {
+        foo,
+        bar,
+
+        // pub const srf_tag_field = "foobar";
+    };
+
+    const Data = struct {
+        data_type: ?Types = null,
+        yo: u8,
+    };
+    const Data2 = struct {
+        data_type: Types = .bar,
+        yo: u8,
+    };
+
+    const data: []const Data = &.{
+        .{ .data_type = .foo, .yo = 42 },
+        .{ .data_type = null, .yo = 69 },
+    };
+    const alloc = std.testing.allocator;
+    var buf: [4096]u8 = undefined;
+    const compact_from = try std.fmt.bufPrint(
+        &buf,
+        "{f}",
+        .{fmtFrom(Data, alloc, data, .{})},
+    );
+    const expect =
+        \\#!srfv1
+        \\data_type::foo,yo:num:42
+        \\yo:num:69
+        \\
+    ;
+    try std.testing.expectEqualStrings(expect, compact_from);
+
+    var compact_reader = std.Io.Reader.fixed(expect);
+    const parsed = try parse(&compact_reader, std.testing.allocator, .{});
+    defer parsed.deinit();
+
+    const rec1 = try parsed.records.items[0].to(Data);
+    try std.testing.expectEqualDeep(data[0], rec1);
+    const rec2 = try parsed.records.items[1].to(Data);
+    try std.testing.expectEqualDeep(data[1], rec2);
+
+    const missing_tag =
+        \\#!srfv1
+        \\yo:num:69
+        \\
+    ;
+    var mt_reader = std.Io.Reader.fixed(missing_tag);
+    const mt_parsed = try parse(&mt_reader, std.testing.allocator, .{});
+    defer mt_parsed.deinit();
+    const mt_rec1 = try mt_parsed.records.items[0].to(Data);
+    try std.testing.expect(mt_rec1.data_type == null);
+
+    const mt_rec1_dt2 = try mt_parsed.records.items[0].to(Data2);
+    try std.testing.expect(mt_rec1_dt2.data_type == .bar);
+}
 test "compact format length-prefixed string as last field" {
     // When a length-prefixed value is the last field on the line,
     // rest_of_data.len == size exactly. The check on line 216 uses
