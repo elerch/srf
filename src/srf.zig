@@ -601,7 +601,7 @@ pub const Parsed = struct {
         _ = writer;
     }
 
-    pub fn is_fresh(self: Parsed) bool {
+    pub fn isFresh(self: Parsed) bool {
         if (self.expires) |exp|
             return std.time.timestamp() < exp;
 
