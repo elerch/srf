@@ -519,24 +519,49 @@ pub const Record = struct {
 
     /// Coerce Record to a type. Does not handle fields with arrays
     pub fn to(self: Record, comptime T: type) !T {
-        // SAFETY: all fields updated below or error is returned
-        var obj: T = undefined;
-        inline for (std.meta.fields(T)) |type_field| {
-            // find the field in the data by field name, set the value
-            // if not found, return an error
-            if (self.firstFieldByName(type_field.name)) |srf_field| {
-                @field(obj, type_field.name) = try coerce(type_field.name, type_field.type, srf_field.value);
-            } else {
-                // No srf_field found...revert to default value
-                if (type_field.default_value_ptr) |ptr| {
-                    @field(obj, type_field.name) = @as(*const type_field.type, @ptrCast(@alignCast(ptr))).*;
-                } else {
-                    log.debug("Record could not be coerced. Field {s} not found on srf data, and no default value exists on the type", .{type_field.name});
-                    return error.FieldNotFoundOnFieldWithoutDefaultValue;
+        const ti = @typeInfo(T);
+
+        switch (ti) {
+            .@"struct" => {
+                // SAFETY: all fields updated below or error is returned
+                var obj: T = undefined;
+                inline for (std.meta.fields(T)) |type_field| {
+                    // find the field in the data by field name, set the value
+                    // if not found, return an error
+                    if (self.firstFieldByName(type_field.name)) |srf_field| {
+                        @field(obj, type_field.name) = try coerce(type_field.name, type_field.type, srf_field.value);
+                    } else {
+                        // No srf_field found...revert to default value
+                        if (type_field.default_value_ptr) |ptr| {
+                            @field(obj, type_field.name) = @as(*const type_field.type, @ptrCast(@alignCast(ptr))).*;
+                        } else {
+                            log.debug("Record could not be coerced. Field {s} not found on srf data, and no default value exists on the type", .{type_field.name});
+                            return error.FieldNotFoundOnFieldWithoutDefaultValue;
+                        }
+                    }
                 }
-            }
+                return obj;
+            },
+            .@"union" => {
+                const active_tag_name = if (@hasDecl(T, "srf_tag_field"))
+                    T.srf_tag_field
+                else
+                    "active_tag";
+                if (self.firstFieldByName(active_tag_name)) |srf_field| {
+                    if (srf_field.value == null or srf_field.value.? != .string)
+                        return error.ActiveTagValueMustBeAString;
+                    const active_tag = srf_field.value.?.string;
+                    inline for (std.meta.fields(T)) |f| {
+                        if (std.mem.eql(u8, active_tag, f.name)) {
+                            return @unionInit(T, f.name, try self.to(f.type));
+                        }
+                    }
+                    return error.ActiveTagDoesNotExist;
+                } else return error.ActiveTagFieldNotFound;
+            },
+            else => @compileError("Deserialization not supported on " ++ @tagName(ti) ++ " types"),
         }
-        return obj;
+        return error.CoercionNotPossible;
     }
 };
 
@@ -1292,7 +1317,7 @@ test "unions" {
         foo: Foo,
         bar: Bar,
 
-        //pub const srf_tag_field = "foobar";
+        // pub const srf_tag_field = "foobar";
     };
 
     const data: []const MixedData = &.{
@@ -1313,6 +1338,15 @@ test "unions" {
         \\
     ;
     try std.testing.expectEqualStrings(expect, compact_from);
+
+    var compact_reader = std.Io.Reader.fixed(expect);
+    const parsed = try parse(&compact_reader, std.testing.allocator, .{});
+    defer parsed.deinit();
+
+    const rec1 = try parsed.records.items[0].to(MixedData);
+    try std.testing.expectEqualDeep(data[0], rec1);
+    const rec2 = try parsed.records.items[1].to(MixedData);
+    try std.testing.expectEqualDeep(data[1], rec2);
 }
 test "compact format length-prefixed string as last field" {
     // When a length-prefixed value is the last field on the line,
