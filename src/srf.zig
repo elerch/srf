@@ -658,6 +658,11 @@ pub const FormatOptions = struct {
 
     /// Specify an expiration time for the data being written
     expires: ?i64 = null,
+
+    /// By setting this to false, you can avoid writing any header/footer data
+    /// and just format the record. This is useful for appending to an existing
+    /// srf file rather than overwriting all the data
+    emit_directives: bool = true,
 };
 
 /// Returns a formatter that formats the given value
@@ -713,6 +718,7 @@ test fmt {
     , formatted);
 }
 fn frontMatter(writer: *std.Io.Writer, options: FormatOptions) !void {
+    if (!options.emit_directives) return;
     try writer.writeAll("#!srfv1\n");
     if (options.long_format)
         try writer.writeAll("#!long\n");
@@ -722,6 +728,7 @@ fn frontMatter(writer: *std.Io.Writer, options: FormatOptions) !void {
         try writer.print("#!expires={d}\n", .{e});
 }
 fn epilogue(writer: *std.Io.Writer, options: FormatOptions) !void {
+    if (!options.emit_directives) return;
     if (options.emit_eof)
         try writer.writeAll("#!eof\n");
 }
