@@ -43,7 +43,7 @@ pub const Diagnostics = struct {
         }
         try self.errors.append(allocator, err);
     }
-    pub fn deinit(self: Parsed) void {
+    pub fn deinit(self: Diagnostics) void {
         // From parse, three things can happen:
         // 1. Happy path - record comes back, deallocation happens on that deinit
         // 2. Errors is returned, no diagnostics provided. Deallocation happens in parse on errdefer
@@ -86,12 +86,12 @@ pub const Value = union(enum) {
     //         .boolean => try writer.print("boolean: {}", .{self.boolean}),
     //     }
     // }
-    pub fn parse(allocator: std.mem.Allocator, str: []const u8, state: *ParseState, delimiter: u8, options: ParseOptions) ParseError!ValueWithMetaData {
+    pub fn parse(allocator: std.mem.Allocator, str: []const u8, state: *RecordIterator.State, delimiter: u8) ParseError!ValueWithMetaData {
         const debug = str.len > 2 and str[0] == '1' and str[1] == '1';
         if (debug) log.debug("parsing {s}", .{str});
         const type_val_sep_raw = std.mem.indexOfScalar(u8, str, ':');
         if (type_val_sep_raw == null) {
-            try parseError(allocator, options, "no type data or value after key", state.*);
+            try parseError(allocator, "no type data or value after key", state.*);
             return ParseError.ParseFailed;
         }
 
@@ -107,7 +107,7 @@ pub const Value = union(enum) {
             state.column += total_chars;
             state.partial_line_column += total_chars;
             return .{
-                .item_value = .{ .string = try dupe(allocator, options, val) },
+                .item_value = .{ .string = try dupe(allocator, state.options, val) },
             };
         }
         if (std.mem.eql(u8, "binary", trimmed_meta)) {
@@ -121,7 +121,7 @@ pub const Value = union(enum) {
             state.partial_line_column += total_chars;
             const Decoder = std.base64.standard.Decoder;
             const size = Decoder.calcSizeForSlice(val) catch {
-                try parseError(allocator, options, "error parsing base64 value", state.*);
+                try parseError(allocator, "error parsing base64 value", state.*);
                 return .{
                     .item_value = null,
                     .error_parsing = true,
@@ -130,7 +130,7 @@ pub const Value = union(enum) {
             const data = try allocator.alloc(u8, size);
             errdefer allocator.free(data);
             Decoder.decode(data, val) catch {
-                try parseError(allocator, options, "error parsing base64 value", state.*);
+                try parseError(allocator, "error parsing base64 value", state.*);
                 allocator.free(data);
                 return .{
                     .item_value = null,
@@ -151,7 +151,7 @@ pub const Value = union(enum) {
             state.partial_line_column += total_chars;
             const val_trimmed = std.mem.trim(u8, val, &std.ascii.whitespace);
             const number = std.fmt.parseFloat(@FieldType(Value, "number"), val_trimmed) catch {
-                try parseError(allocator, options, "error parsing numeric value", state.*);
+                try parseError(allocator, "error parsing numeric value", state.*);
                 return .{
                     .item_value = null,
                     .error_parsing = true,
@@ -173,7 +173,7 @@ pub const Value = union(enum) {
                 if (std.mem.eql(u8, "false", val_trimmed)) break :blk false;
                 if (std.mem.eql(u8, "true", val_trimmed)) break :blk true;
 
-                try parseError(allocator, options, "error parsing boolean value", state.*);
+                try parseError(allocator, "error parsing boolean value", state.*);
                 return .{
                     .item_value = null,
                     .error_parsing = true,
@@ -200,7 +200,7 @@ pub const Value = union(enum) {
         state.partial_line_column += total_metadata_chars;
         const size = std.fmt.parseInt(usize, trimmed_meta, 0) catch {
             log.debug("parseInt fail, trimmed_data: '{s}'", .{trimmed_meta});
-            try parseError(allocator, options, "unrecognized metadata for key", state.*);
+            try parseError(allocator, "unrecognized metadata for key", state.*);
             return .{
                 .item_value = null,
                 .error_parsing = true,
@@ -228,7 +228,7 @@ pub const Value = union(enum) {
         // This is not enough, we need more data from the reader
         log.debug("item value includes newlines {f}", .{state});
         // We need to advance the reader, so we need a copy of what we have so fa
-        const start = try dupe(allocator, options, rest_of_data);
+        const start = try dupe(allocator, state.options, rest_of_data);
         defer allocator.free(start);
         // We won't do a parseError here. If we have an allocation error, read
         // error, or end of stream, all of these are fatal. Our reader is currently
@@ -583,25 +583,206 @@ pub const Record = struct {
 /// When implemented, there will include a pub fn bind(self: Parsed, comptime T: type, options, BindOptions) BindError![]T
 /// function. The options will include things related to duplicate handling and
 /// missing fields
-pub const Parsed = struct {
-    records: std.ArrayList(Record),
+pub const RecordIterator = struct {
     arena: *std.heap.ArenaAllocator,
     /// optional expiry time for the data. Useful for caching
     /// Note that on a parse, data will always be returned and it will be up
     /// to the caller to check is_fresh and determine the right thing to do
     expires: ?i64,
 
-    pub fn deinit(self: Parsed) void {
+    state: *State,
+
+    pub const State = struct {
+        line: usize = 0,
+        column: usize = 0,
+        partial_line_column: usize = 0,
+        reader: *std.Io.Reader,
+        options: ParseOptions,
+
+        require_eof: bool = false,
+        eof_found: bool = false,
+        current_line: ?[]const u8,
+
+        field_delimiter: u8 = ',',
+        end_of_record_reached: bool = false,
+
+        /// Takes the next line, trimming leading whitespace and ignoring comments
+        /// Directives (comments starting with #!) are preserved
+        pub fn nextLine(state: *State) ?[]const u8 {
+            while (true) {
+                state.line += 1;
+                state.column = 1; // column is human indexed (one-based)
+                state.partial_line_column = 0; // partial_line_column is zero indexed for computers
+                const raw_line = (state.reader.takeDelimiter('\n') catch return null) orelse return null;
+                // we don't want to trim the end, as there might be a key/value field
+                // with a string including important trailing whitespace
+                const trimmed_line = std.mem.trimStart(u8, raw_line, &std.ascii.whitespace);
+                if (std.mem.startsWith(u8, trimmed_line, "#") and !std.mem.startsWith(u8, trimmed_line, "#!")) continue;
+                return trimmed_line;
+            }
+        }
+        pub fn format(self: State, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            try writer.print("line: {}, col: {}", .{ self.line, self.column });
+        }
+    };
+
+    pub fn next(self: RecordIterator) !?FieldIterator {
+        // TODO: we need to capture the fieldIterator here and make sure it's run
+        // to the ground to keep our state intact
+        const state = self.state;
+        if (state.current_line == null) {
+            if (state.options.diagnostics) |d|
+                if (d.errors.items.len > 0) return ParseError.ParseFailed;
+            if (state.require_eof and !state.eof_found) return ParseError.ParseFailed;
+            return null;
+        }
+        while (std.mem.trim(u8, state.current_line.?, &std.ascii.whitespace).len == 0) {
+            // empty lines can be signficant (to indicate a new record, but only once
+            // a record is processed, which requires data first. That record processing
+            // is at the bottom of the loop, so if an empty line is detected here, we can
+            // safely ignore it
+            state.current_line = state.nextLine();
+            // by calling recursively we get the error handling above
+            if (state.current_line == null) return self.next();
+        }
+        // non-blank line, but we could have an eof marker
+        if (try Directive.parse(self.arena.allocator(), state.current_line.?, state.*)) |d| {
+            switch (d) {
+                .eof => {
+                    // there needs to be an eof then
+                    if (state.nextLine()) |_| {
+                        try parseError(self.arena.allocator(), "Data found after #!eof", state.*);
+                        return ParseError.ParseFailed; // this is terminal
+                    } else {
+                        state.eof_found = true;
+                        state.current_line = null;
+                        return null; // all is good, we're done
+                    }
+                },
+                else => {
+                    try parseError(self.arena.allocator(), "Directive found after data started", state.*);
+                    state.current_line = state.nextLine();
+                    // TODO: This runs the risk of a malicious file creating
+                    // a stackoverflow by using many non-eof directives
+                    return self.next();
+                },
+            }
+        }
+        state.end_of_record_reached = false;
+        return .{ .ri = self };
+    }
+
+    pub const FieldIterator = struct {
+        ri: RecordIterator,
+
+        pub fn next(self: FieldIterator) !?Field {
+            const state = self.ri.state;
+            // Main parsing. We already have the first line of data, which could
+            // be a record (compact format) or a key/value pair (long format)
+
+            // log.debug("", .{});
+            log.debug("current line:{?s}", .{state.current_line});
+            if (state.current_line == null) return null;
+            if (state.end_of_record_reached) return null;
+            // non-blank line, but we could have an eof marker
+            // TODO: deduplicate this code
+            if (try Directive.parse(self.ri.arena.allocator(), state.current_line.?, state.*)) |d| {
+                switch (d) {
+                    .eof => {
+                        // there needs to be an eof then
+                        if (state.nextLine()) |_| {
+                            try parseError(self.ri.arena.allocator(), "Data found after #!eof", state.*);
+                            return ParseError.ParseFailed; // this is terminal
+                        } else {
+                            state.eof_found = true;
+                            state.current_line = null;
+                            return null; // all is good, we're done
+                        }
+                    },
+                    else => {
+                        try parseError(self.ri.arena.allocator(), "Directive found after data started", state.*);
+                        state.current_line = state.nextLine();
+                        // TODO: This runs the risk of a malicious file creating
+                        // a stackoverflow by using many non-eof directives
+                        return self.next();
+                    },
+                }
+            }
+
+            // Whatever the format, the beginning will always be the key data
+            // key:stuff:value
+            var it = std.mem.splitScalar(u8, state.current_line.?, ':');
+            const key = it.next().?; // first one we get for free
+            if (key.len > 0) std.debug.assert(key[0] != state.field_delimiter);
+            state.column += key.len + 1;
+            state.partial_line_column += key.len + 1;
+            const value = try Value.parse(
+                self.ri.arena.allocator(),
+                it.rest(),
+                state,
+                state.field_delimiter,
+            );
+
+            var field: ?Field = null;
+            if (!value.error_parsing) {
+                field = .{ .key = try dupe(self.ri.arena.allocator(), state.options, key), .value = value.item_value };
+            }
+
+            if (value.reader_advanced and state.field_delimiter == ',') {
+                log.debug("advanced", .{});
+                // In compact format we'll stay on the same line
+                const real_column = state.column;
+                state.current_line = state.nextLine();
+                // Reset line and column position, because we're actually staying on the same line now
+                state.line -= 1;
+                state.column = real_column + 1;
+                state.partial_line_column = 0;
+            }
+
+            // The difference between compact and line here is that compact we will instead of
+            // line = try nextLine, we will do something like line = line[42..]
+            if (state.field_delimiter == '\n') {
+                state.current_line = state.nextLine();
+                if (state.current_line == null) {
+                    state.end_of_record_reached = true;
+                    return field;
+                }
+                // close out record, return
+                if (state.current_line.?.len == 0) {
+                    // End of record
+                    state.end_of_record_reached = true;
+                    state.current_line = state.nextLine();
+                    return field;
+                }
+            } else {
+                // We should be on a delimiter, otherwise, we should be at the end
+                state.current_line = state.current_line.?[state.partial_line_column..]; // can't use l here because line may have been reassigned
+                state.partial_line_column = 0;
+                if (state.current_line.?.len == 0) {
+                    // close out record
+                    state.current_line = state.nextLine();
+                    state.partial_line_column = 0;
+                    state.end_of_record_reached = true;
+                    return field;
+                } else {
+                    if (state.current_line.?[0] != state.field_delimiter) {
+                        log.err("reset line for next item, first char not '{c}':{?s}", .{ state.field_delimiter, state.current_line });
+                        return error.ParseFailed;
+                    }
+                    state.current_line = state.current_line.?[1..];
+                }
+            }
+            return field;
+        }
+    };
+
+    pub fn deinit(self: RecordIterator) void {
         const child_allocator = self.arena.child_allocator;
         self.arena.deinit();
         child_allocator.destroy(self.arena);
     }
-    pub fn format(self: Parsed, writer: *std.Io.Writer) std.Io.Writer.Error!void {
-        _ = self;
-        _ = writer;
-    }
 
-    pub fn isFresh(self: Parsed) bool {
+    pub fn isFresh(self: RecordIterator) bool {
         if (self.expires) |exp|
             return std.time.timestamp() < exp;
 
@@ -628,7 +809,7 @@ const Directive = union(enum) {
     eof,
     expires: i64,
 
-    pub fn parse(allocator: std.mem.Allocator, str: []const u8, state: ParseState, options: ParseOptions) ParseError!?Directive {
+    pub fn parse(allocator: std.mem.Allocator, str: []const u8, state: RecordIterator.State) ParseError!?Directive {
         if (!std.mem.startsWith(u8, str, "#!")) return null;
         // strip any comments off
         var it = std.mem.splitScalar(u8, str[2..], '#');
@@ -636,7 +817,7 @@ const Directive = union(enum) {
         if (std.mem.eql(u8, "srfv1", line)) return .magic;
         if (std.mem.eql(u8, "requireeof", line)) return .require_eof;
         if (std.mem.eql(u8, "requireof", line)) {
-            try parseError(allocator, options, "#!requireof found. Did you mean #!requireeof?", state);
+            try parseError(allocator, "#!requireof found. Did you mean #!requireeof?", state);
             return null;
         }
         if (std.mem.eql(u8, "eof", line)) return .eof;
@@ -779,192 +960,105 @@ pub const RecordFormatter = struct {
         }
     }
 };
-pub const ParseState = struct {
-    reader: *std.Io.Reader,
-    line: usize,
-    column: usize,
-    partial_line_column: usize,
 
-    pub fn format(self: ParseState, writer: *std.Io.Writer) std.Io.Writer.Error!void {
-        try writer.print("line: {}, col: {}", .{ self.line, self.column });
+pub const Parsed = struct {
+    // TODO: rip this down and return an array from parse
+    records: std.ArrayList(Record),
+    arena: *std.heap.ArenaAllocator,
+    expires: ?i64,
+
+    pub fn deinit(self: Parsed) void {
+        const ca = self.arena.child_allocator;
+        self.arena.deinit();
+        ca.destroy(self.arena);
     }
 };
+
+/// parse function. Prefer iterator over this function. Note that this function will
+/// change soon
 pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: ParseOptions) ParseError!Parsed {
+    var records = std.ArrayList(Record).empty;
+    var it = try iterator(reader, allocator, options);
+    errdefer it.deinit();
+    const aa = it.arena.allocator();
+    while (try it.next()) |fi| {
+        var al = std.ArrayList(Field).empty;
+        while (try fi.next()) |f| {
+            const val = if (f.value != null)
+                switch (f.value.?) {
+                    .string => Value{ .string = try aa.dupe(u8, f.value.?.string) },
+                    .bytes => Value{ .bytes = try aa.dupe(u8, f.value.?.bytes) },
+                    else => f.value,
+                }
+            else
+                f.value;
+            try al.append(aa, .{
+                .key = try aa.dupe(u8, f.key),
+                .value = val,
+            });
+        }
+        try records.append(aa, .{
+            .fields = try al.toOwnedSlice(aa),
+        });
+    }
+    return .{
+        .records = records,
+        .arena = it.arena,
+        .expires = it.expires,
+    };
+}
+
+/// Gets an iterator to stream through the data
+pub fn iterator(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: ParseOptions) ParseError!RecordIterator {
+
+    // TODO: What can we do about allocations here?
+
     // create an arena allocator for everytyhing related to parsing
     const arena: *std.heap.ArenaAllocator = try allocator.create(std.heap.ArenaAllocator);
     errdefer if (options.diagnostics == null) allocator.destroy(arena);
     arena.* = .init(allocator);
     errdefer if (options.diagnostics == null) arena.deinit();
     const aa = arena.allocator();
-    var long_format = false; // Default to compact format
-    var require_eof = false; // Default to no eof required
-    var eof_found: bool = false;
-    var state = ParseState{ .line = 0, .column = 0, .partial_line_column = 0, .reader = reader };
-    const first_line = nextLine(reader, &state) orelse return ParseError.ParseFailed;
-
-    if (try Directive.parse(aa, first_line, state, options)) |d| {
-        if (d != .magic) try parseError(aa, options, "Magic header not found on first line", state);
-    } else try parseError(aa, options, "Magic header not found on first line", state);
-
-    // Loop through the header material and configure our main parsing
-    var parsed: Parsed = .{
-        .records = .empty,
+    const state = try aa.create(RecordIterator.State);
+    state.* = .{
+        .reader = reader,
+        .current_line = null,
+        .options = options,
+    };
+    var it: RecordIterator = .{
         .arena = arena,
         .expires = null,
+        .state = state,
     };
-    const first_data = blk: {
-        while (nextLine(reader, &state)) |line| {
-            if (try Directive.parse(aa, line, state, options)) |d| {
+    const first_line = it.state.nextLine() orelse return ParseError.ParseFailed;
+
+    if (try Directive.parse(aa, first_line, it.state.*)) |d| {
+        if (d != .magic) try parseError(aa, "Magic header not found on first line", it.state.*);
+    } else try parseError(aa, "Magic header not found on first line", it.state.*);
+
+    // Loop through the header material and configure our main parsing
+    it.state.current_line = blk: {
+        while (it.state.nextLine()) |line| {
+            if (try Directive.parse(aa, line, it.state.*)) |d| {
                 switch (d) {
-                    .magic => try parseError(aa, options, "Found a duplicate magic header", state),
-                    .long_format => long_format = true,
-                    .compact_format => long_format = false, // what if we have both?
-                    .require_eof => require_eof = true,
-                    .expires => |exp| parsed.expires = exp,
+                    .magic => try parseError(aa, "Found a duplicate magic header", it.state.*),
+                    .long_format => it.state.field_delimiter = '\n',
+                    .compact_format => it.state.field_delimiter = ',', // what if we have both?
+                    .require_eof => it.state.require_eof = true,
+                    .expires => |exp| it.expires = exp,
                     .eof => {
                         // there needs to be an eof then
-                        if (nextLine(reader, &state)) |_| {
-                            try parseError(aa, options, "Data found after #!eof", state);
+                        if (it.state.nextLine()) |_| {
+                            try parseError(aa, "Data found after #!eof", it.state.*);
                             return ParseError.ParseFailed; // this is terminal
-                        } else return parsed;
+                        } else return it;
                     },
                 }
             } else break :blk line;
         }
-        return parsed;
+        return it; //without current_line - we're at the end of file
     };
-
-    // Main parsing. We already have the first line of data, which could
-    // be a record (compact format) or a key/value pair (long format)
-    var line: ?[]const u8 = first_data;
-    var items: std.ArrayList(Field) = .empty;
-
-    // Because in long format we don't have newline delimiter, that should really be a noop
-    // but we need this for compact format
-    const delimiter: u8 = if (long_format) '\n' else ',';
-    // log.debug("", .{});
-    // log.debug("first line:{?s}", .{line});
-    while (line) |l| {
-        if (std.mem.trim(u8, l, &std.ascii.whitespace).len == 0) {
-            // empty lines can be signficant (to indicate a new record, but only once
-            // a record is processed, which requires data first. That record processing
-            // is at the bottom of the loop, so if an empty line is detected here, we can
-            // safely ignore it
-            line = nextLine(reader, &state);
-            continue;
-        }
-        if (try Directive.parse(aa, l, state, options)) |d| {
-            switch (d) {
-                .eof => {
-                    // there needs to be an eof then
-                    if (nextLine(reader, &state)) |_| {
-                        try parseError(aa, options, "Data found after #!eof", state);
-                        return ParseError.ParseFailed; // this is terminal
-                    } else {
-                        eof_found = true;
-                        break;
-                    }
-                },
-                else => try parseError(aa, options, "Directive found after data started", state),
-            }
-            continue;
-        }
-
-        // Real data: lfg
-        // Whatever the format, the beginning will always be the key data
-        // key:stuff:value
-        var it = std.mem.splitScalar(u8, l, ':');
-        const key = it.next().?; // first one we get for free
-        if (key.len > 0) std.debug.assert(key[0] != delimiter);
-        state.column += key.len + 1;
-        state.partial_line_column += key.len + 1;
-        const value = try Value.parse(
-            aa,
-            it.rest(),
-            &state,
-            delimiter,
-            options,
-        );
-
-        if (!value.error_parsing) {
-            // std.debug.print("alloc on key: {s}, val: {?f}\n", .{ key, value.item_value });
-            try items.append(aa, .{ .key = try aa.dupe(u8, key), .value = value.item_value });
-        }
-
-        if (value.reader_advanced and !long_format) {
-            // In compact format we'll stay on the same line
-            const real_column = state.column;
-            line = nextLine(reader, &state);
-            // Reset line and column position, because we're actually staying on the same line now
-            state.line -= 1;
-            state.column = real_column + 1;
-            state.partial_line_column = 0;
-        }
-
-        // The difference between compact and line here is that compact we will instead of
-        // line = try nextLine, we will do something like line = line[42..]
-        if (long_format) {
-            const maybe_line = nextLine(reader, &state);
-            if (maybe_line == null) {
-                // close out record, return
-                try parsed.records.append(aa, .{
-                    .fields = try items.toOwnedSlice(aa),
-                });
-                break;
-            }
-            line = maybe_line.?;
-            if (line.?.len == 0) {
-                // End of record
-                try parsed.records.append(aa, .{
-                    .fields = try items.toOwnedSlice(aa),
-                });
-                line = nextLine(reader, &state);
-            }
-        } else {
-            // We should be on a delimiter, otherwise, we should be at the end
-            line = line.?[state.partial_line_column..]; // can't use l here because line may have been reassigned
-            state.partial_line_column = 0;
-            if (line.?.len == 0) {
-                // close out record
-                try parsed.records.append(aa, .{
-                    .fields = try items.toOwnedSlice(aa),
-                });
-                line = nextLine(reader, &state);
-                state.partial_line_column = 0;
-            } else {
-                if (line.?[0] != delimiter) {
-                    log.err("reset line for next item, first char not '{c}':{?s}", .{ delimiter, line });
-                    return error.ParseFailed;
-                }
-                line = line.?[1..];
-            }
-        }
-    }
-    // Parsing complete. Add final record to list. Then, if there are any parse errors, throw
-    if (items.items.len > 0)
-        try parsed.records.append(aa, .{
-            .fields = try items.toOwnedSlice(aa),
-        });
-    if (options.diagnostics) |d|
-        if (d.errors.items.len > 0) return ParseError.ParseFailed;
-    if (require_eof and !eof_found) return ParseError.ParseFailed;
-    return parsed;
-}
-
-/// Takes the next line, trimming leading whitespace and ignoring comments
-/// Directives (comments starting with #!) are preserved
-fn nextLine(reader: *std.Io.Reader, state: *ParseState) ?[]const u8 {
-    while (true) {
-        state.line += 1;
-        state.column = 1; // column is human indexed (one-based)
-        state.partial_line_column = 0; // partial_line_column is zero indexed for computers
-        const raw_line = (reader.takeDelimiter('\n') catch return null) orelse return null;
-        // we don't want to trim the end, as there might be a key/value field
-        // with a string including important trailing whitespace
-        const trimmed_line = std.mem.trimStart(u8, raw_line, &std.ascii.whitespace);
-        if (std.mem.startsWith(u8, trimmed_line, "#") and !std.mem.startsWith(u8, trimmed_line, "#!")) continue;
-        return trimmed_line;
-    }
+    return it; // with current_line
 }
 
 inline fn dupe(allocator: std.mem.Allocator, options: ParseOptions, data: []const u8) ParseError![]const u8 {
@@ -972,11 +1066,11 @@ inline fn dupe(allocator: std.mem.Allocator, options: ParseOptions, data: []cons
         return try allocator.dupe(u8, data);
     return data;
 }
-inline fn parseError(allocator: std.mem.Allocator, options: ParseOptions, message: []const u8, state: ParseState) ParseError!void {
+inline fn parseError(allocator: std.mem.Allocator, message: []const u8, state: RecordIterator.State) ParseError!void {
     log.debug("Parse error. Parse state {f}, message: {s}", .{ state, message });
-    if (options.diagnostics) |d| {
+    if (state.options.diagnostics) |d| {
         try d.addError(allocator, .{
-            .message = try dupe(allocator, options, message),
+            .message = try dupe(allocator, state.options, message),
             .level = .err,
             .line = state.line,
             .column = state.column,
@@ -985,7 +1079,6 @@ inline fn parseError(allocator: std.mem.Allocator, options: ParseOptions, messag
         return ParseError.ParseFailed;
     }
 }
-
 test "long format single record, no eof" {
     const data =
         \\#!srfv1 # mandatory comment with format and version. Parser instructions start with #!
@@ -1434,4 +1527,36 @@ test "compact format length-prefixed string as last field" {
     try std.testing.expectEqualStrings("alice", rec.fields[0].value.?.string);
     try std.testing.expectEqualStrings("desc", rec.fields[1].key);
     try std.testing.expectEqualStrings("world", rec.fields[1].value.?.string);
+}
+test "iterator" {
+    // When a length-prefixed value is the last field on the line,
+    // rest_of_data.len == size exactly. The check on line 216 uses
+    // strict > instead of >=, falling through to the multi-line path
+    // where size - rest_of_data.len - 1 underflows.
+    const data =
+        \\#!srfv1
+        \\name::alice,desc:5:world
+    ;
+    const allocator = std.testing.allocator;
+    var reader = std.Io.Reader.fixed(data);
+    var ri = try iterator(&reader, allocator, .{});
+    defer ri.deinit();
+
+    const nfi = try ri.next();
+    try std.testing.expect(nfi != null);
+    const fi = nfi.?;
+    // defer fi.deinit();
+    const field1 = try fi.next();
+    try std.testing.expect(field1 != null);
+    try std.testing.expectEqualStrings("name", field1.?.key);
+    try std.testing.expectEqualStrings("alice", field1.?.value.?.string);
+    const field2 = try fi.next();
+    try std.testing.expect(field2 != null);
+    try std.testing.expectEqualStrings("desc", field2.?.key);
+    try std.testing.expectEqualStrings("world", field2.?.value.?.string);
+    const field3 = try fi.next();
+    try std.testing.expect(field3 == null);
+
+    const next = try ri.next();
+    try std.testing.expect(next == null);
 }
