@@ -87,11 +87,9 @@ pub const Value = union(enum) {
     //     }
     // }
     pub fn parse(allocator: std.mem.Allocator, str: []const u8, state: *RecordIterator.State, delimiter: u8) ParseError!ValueWithMetaData {
-        const debug = str.len > 2 and str[0] == '1' and str[1] == '1';
-        if (debug) log.debug("parsing {s}", .{str});
         const type_val_sep_raw = std.mem.indexOfScalar(u8, str, ':');
         if (type_val_sep_raw == null) {
-            try parseError(allocator, "no type data or value after key", state.*);
+            try parseError(allocator, "no type data or value after key", state);
             return ParseError.ParseFailed;
         }
 
@@ -121,7 +119,7 @@ pub const Value = union(enum) {
             state.partial_line_column += total_chars;
             const Decoder = std.base64.standard.Decoder;
             const size = Decoder.calcSizeForSlice(val) catch {
-                try parseError(allocator, "error parsing base64 value", state.*);
+                try parseError(allocator, "error parsing base64 value", state);
                 return .{
                     .item_value = null,
                     .error_parsing = true,
@@ -130,7 +128,7 @@ pub const Value = union(enum) {
             const data = try allocator.alloc(u8, size);
             errdefer allocator.free(data);
             Decoder.decode(data, val) catch {
-                try parseError(allocator, "error parsing base64 value", state.*);
+                try parseError(allocator, "error parsing base64 value", state);
                 allocator.free(data);
                 return .{
                     .item_value = null,
@@ -151,7 +149,7 @@ pub const Value = union(enum) {
             state.partial_line_column += total_chars;
             const val_trimmed = std.mem.trim(u8, val, &std.ascii.whitespace);
             const number = std.fmt.parseFloat(@FieldType(Value, "number"), val_trimmed) catch {
-                try parseError(allocator, "error parsing numeric value", state.*);
+                try parseError(allocator, "error parsing numeric value", state);
                 return .{
                     .item_value = null,
                     .error_parsing = true,
@@ -173,7 +171,7 @@ pub const Value = union(enum) {
                 if (std.mem.eql(u8, "false", val_trimmed)) break :blk false;
                 if (std.mem.eql(u8, "true", val_trimmed)) break :blk true;
 
-                try parseError(allocator, "error parsing boolean value", state.*);
+                try parseError(allocator, "error parsing boolean value", state);
                 return .{
                     .item_value = null,
                     .error_parsing = true,
@@ -200,18 +198,16 @@ pub const Value = union(enum) {
         state.partial_line_column += total_metadata_chars;
         const size = std.fmt.parseInt(usize, trimmed_meta, 0) catch {
             log.debug("parseInt fail, trimmed_data: '{s}'", .{trimmed_meta});
-            try parseError(allocator, "unrecognized metadata for key", state.*);
+            try parseError(allocator, "unrecognized metadata for key", state);
             return .{
                 .item_value = null,
                 .error_parsing = true,
             };
         };
-        if (debug) log.debug("found fixed string size {d}. State {f}", .{ size, state });
         // Update again for number of bytes. All failures beyond this point are
         // fatal, so this is safe.
         state.column += size;
         state.partial_line_column += size;
-        if (debug) log.debug("New state {f}", .{state});
 
         // If we are being asked specifically for bytes, we no longer care about
         // delimiters. We just want raw bytes. This might adjust our line/column
@@ -220,41 +216,29 @@ pub const Value = union(enum) {
         if (rest_of_data.len >= size) {
             // We fit on this line, everything is "normal"
             const val = rest_of_data[0..size];
-            if (debug) log.debug("val {s}", .{val});
             return .{
                 .item_value = .{ .string = val },
             };
         }
         // This is not enough, we need more data from the reader
-        log.debug("item value includes newlines {f}", .{state});
-        // We need to advance the reader, so we need a copy of what we have so fa
-        const start = try dupe(allocator, state.options, rest_of_data);
-        defer allocator.free(start);
+        const buf = try allocator.alloc(u8, size);
+        errdefer allocator.free(buf);
+        @memcpy(buf[0..rest_of_data.len], rest_of_data);
+        // add back the newline we are skipping
+        buf[rest_of_data.len] = '\n';
         // We won't do a parseError here. If we have an allocation error, read
         // error, or end of stream, all of these are fatal. Our reader is currently
         // past the newline, so we have to remove a character from size to account.
-        const end = try state.reader.readAlloc(allocator, size - rest_of_data.len - 1);
+        try state.reader.readSliceAll(buf[rest_of_data.len + 1 ..]);
         // However, we want to be past the end of the *next* newline too (in long
         // format mode)
         if (delimiter == '\n') state.reader.toss(1);
-        defer allocator.free(end);
-        // This \n is because the reader state will have advanced beyond the next newline, so end
-        // really should start with the newline. This only applies to long mode, because otherwise the
-        // entire record is a single line
-        const final = try std.mem.concat(allocator, u8, &.{ start, "\n", end });
-        // const final = if (delimiter == '\n')
-        //     try std.mem.concat(allocator, u8, &.{ start, "\n", end })
-        // else
-        //     try std.mem.concat(allocator, u8, &.{ start, end });
-        errdefer allocator.free(final);
-        // log.debug("full val: {s}", .{final});
-        std.debug.assert(final.len == size);
         // Because we've now advanced the line, we need to reset everything
-        state.line += std.mem.count(u8, final, "\n");
-        state.column = final.len - std.mem.lastIndexOf(u8, final, "\n").?;
+        state.line += std.mem.count(u8, buf, "\n");
+        state.column = buf.len - std.mem.lastIndexOf(u8, buf, "\n").?;
         state.partial_line_column = state.column;
         return .{
-            .item_value = .{ .string = final },
+            .item_value = .{ .string = buf },
             .reader_advanced = true,
         };
     }
@@ -646,12 +630,12 @@ pub const RecordIterator = struct {
             if (state.current_line == null) return self.next();
         }
         // non-blank line, but we could have an eof marker
-        if (try Directive.parse(self.arena.allocator(), state.current_line.?, state.*)) |d| {
+        if (try Directive.parse(self.arena.allocator(), state.current_line.?, state)) |d| {
             switch (d) {
                 .eof => {
                     // there needs to be an eof then
                     if (state.nextLine()) |_| {
-                        try parseError(self.arena.allocator(), "Data found after #!eof", state.*);
+                        try parseError(self.arena.allocator(), "Data found after #!eof", state);
                         return ParseError.ParseFailed; // this is terminal
                     } else {
                         state.eof_found = true;
@@ -660,7 +644,7 @@ pub const RecordIterator = struct {
                     }
                 },
                 else => {
-                    try parseError(self.arena.allocator(), "Directive found after data started", state.*);
+                    try parseError(self.arena.allocator(), "Directive found after data started", state);
                     state.current_line = state.nextLine();
                     // TODO: This runs the risk of a malicious file creating
                     // a stackoverflow by using many non-eof directives
@@ -677,6 +661,7 @@ pub const RecordIterator = struct {
 
         pub fn next(self: FieldIterator) !?Field {
             const state = self.ri.state;
+            const aa = self.ri.arena.allocator();
             // Main parsing. We already have the first line of data, which could
             // be a record (compact format) or a key/value pair (long format)
 
@@ -686,12 +671,12 @@ pub const RecordIterator = struct {
             if (state.end_of_record_reached) return null;
             // non-blank line, but we could have an eof marker
             // TODO: deduplicate this code
-            if (try Directive.parse(self.ri.arena.allocator(), state.current_line.?, state.*)) |d| {
+            if (try Directive.parse(aa, state.current_line.?, state)) |d| {
                 switch (d) {
                     .eof => {
                         // there needs to be an eof then
                         if (state.nextLine()) |_| {
-                            try parseError(self.ri.arena.allocator(), "Data found after #!eof", state.*);
+                            try parseError(aa, "Data found after #!eof", state);
                             return ParseError.ParseFailed; // this is terminal
                         } else {
                             state.eof_found = true;
@@ -700,7 +685,7 @@ pub const RecordIterator = struct {
                         }
                     },
                     else => {
-                        try parseError(self.ri.arena.allocator(), "Directive found after data started", state.*);
+                        try parseError(aa, "Directive found after data started", state);
                         state.current_line = state.nextLine();
                         // TODO: This runs the risk of a malicious file creating
                         // a stackoverflow by using many non-eof directives
@@ -717,7 +702,7 @@ pub const RecordIterator = struct {
             state.column += key.len + 1;
             state.partial_line_column += key.len + 1;
             const value = try Value.parse(
-                self.ri.arena.allocator(),
+                aa,
                 it.rest(),
                 state,
                 state.field_delimiter,
@@ -725,7 +710,7 @@ pub const RecordIterator = struct {
 
             var field: ?Field = null;
             if (!value.error_parsing) {
-                field = .{ .key = try dupe(self.ri.arena.allocator(), state.options, key), .value = value.item_value };
+                field = .{ .key = try dupe(aa, state.options, key), .value = value.item_value };
             }
 
             if (value.reader_advanced and state.field_delimiter == ',') {
@@ -809,7 +794,7 @@ const Directive = union(enum) {
     eof,
     expires: i64,
 
-    pub fn parse(allocator: std.mem.Allocator, str: []const u8, state: RecordIterator.State) ParseError!?Directive {
+    pub fn parse(allocator: std.mem.Allocator, str: []const u8, state: *RecordIterator.State) ParseError!?Directive {
         if (!std.mem.startsWith(u8, str, "#!")) return null;
         // strip any comments off
         var it = std.mem.splitScalar(u8, str[2..], '#');
@@ -962,8 +947,7 @@ pub const RecordFormatter = struct {
 };
 
 pub const Parsed = struct {
-    // TODO: rip this down and return an array from parse
-    records: std.ArrayList(Record),
+    records: []Record,
     arena: *std.heap.ArenaAllocator,
     expires: ?i64,
 
@@ -974,35 +958,29 @@ pub const Parsed = struct {
     }
 };
 
-/// parse function. Prefer iterator over this function. Note that this function will
-/// change soon
+/// parse function
 pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: ParseOptions) ParseError!Parsed {
     var records = std.ArrayList(Record).empty;
     var it = try iterator(reader, allocator, options);
     errdefer it.deinit();
     const aa = it.arena.allocator();
+    var field_count: usize = 1;
     while (try it.next()) |fi| {
-        var al = std.ArrayList(Field).empty;
+        var al = try std.ArrayList(Field).initCapacity(aa, field_count);
         while (try fi.next()) |f| {
-            const val = if (f.value != null)
-                switch (f.value.?) {
-                    .string => Value{ .string = try aa.dupe(u8, f.value.?.string) },
-                    .bytes => Value{ .bytes = try aa.dupe(u8, f.value.?.bytes) },
-                    else => f.value,
-                }
-            else
-                f.value;
             try al.append(aa, .{
-                .key = try aa.dupe(u8, f.key),
-                .value = val,
+                .key = f.key,
+                .value = f.value,
             });
         }
+        // assume that most records are same number of fields
+        field_count = @max(field_count, al.items.len);
         try records.append(aa, .{
             .fields = try al.toOwnedSlice(aa),
         });
     }
     return .{
-        .records = records,
+        .records = try records.toOwnedSlice(aa),
         .arena = it.arena,
         .expires = it.expires,
     };
@@ -1032,16 +1010,16 @@ pub fn iterator(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: P
     };
     const first_line = it.state.nextLine() orelse return ParseError.ParseFailed;
 
-    if (try Directive.parse(aa, first_line, it.state.*)) |d| {
-        if (d != .magic) try parseError(aa, "Magic header not found on first line", it.state.*);
-    } else try parseError(aa, "Magic header not found on first line", it.state.*);
+    if (try Directive.parse(aa, first_line, it.state)) |d| {
+        if (d != .magic) try parseError(aa, "Magic header not found on first line", it.state);
+    } else try parseError(aa, "Magic header not found on first line", it.state);
 
     // Loop through the header material and configure our main parsing
     it.state.current_line = blk: {
         while (it.state.nextLine()) |line| {
-            if (try Directive.parse(aa, line, it.state.*)) |d| {
+            if (try Directive.parse(aa, line, it.state)) |d| {
                 switch (d) {
-                    .magic => try parseError(aa, "Found a duplicate magic header", it.state.*),
+                    .magic => try parseError(aa, "Found a duplicate magic header", it.state),
                     .long_format => it.state.field_delimiter = '\n',
                     .compact_format => it.state.field_delimiter = ',', // what if we have both?
                     .require_eof => it.state.require_eof = true,
@@ -1049,7 +1027,7 @@ pub fn iterator(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: P
                     .eof => {
                         // there needs to be an eof then
                         if (it.state.nextLine()) |_| {
-                            try parseError(aa, "Data found after #!eof", it.state.*);
+                            try parseError(aa, "Data found after #!eof", it.state);
                             return ParseError.ParseFailed; // this is terminal
                         } else return it;
                     },
@@ -1066,7 +1044,7 @@ inline fn dupe(allocator: std.mem.Allocator, options: ParseOptions, data: []cons
         return try allocator.dupe(u8, data);
     return data;
 }
-inline fn parseError(allocator: std.mem.Allocator, message: []const u8, state: RecordIterator.State) ParseError!void {
+inline fn parseError(allocator: std.mem.Allocator, message: []const u8, state: *RecordIterator.State) ParseError!void {
     log.debug("Parse error. Parse state {f}, message: {s}", .{ state, message });
     if (state.options.diagnostics) |d| {
         try d.addError(allocator, .{
@@ -1093,9 +1071,9 @@ test "long format single record, no eof" {
     var reader = std.Io.Reader.fixed(data);
     const records = try parse(&reader, allocator, .{});
     defer records.deinit();
-    try std.testing.expectEqual(@as(usize, 1), records.records.items.len);
-    try std.testing.expectEqual(@as(usize, 1), records.records.items[0].fields.len);
-    const kvps = records.records.items[0].fields;
+    try std.testing.expectEqual(@as(usize, 1), records.records.len);
+    try std.testing.expectEqual(@as(usize, 1), records.records[0].fields.len);
+    const kvps = records.records[0].fields;
     try std.testing.expectEqualStrings("key", kvps[0].key);
     try std.testing.expectEqualStrings("string value, with any data except a \\n. an optional string length between the colons", kvps[0].value.?.string);
 }
@@ -1115,7 +1093,7 @@ test "long format from README - generic data structures, first record only" {
     var reader = std.Io.Reader.fixed(data);
     const records = try parse(&reader, allocator, .{});
     defer records.deinit();
-    try std.testing.expectEqual(@as(usize, 1), records.records.items.len);
+    try std.testing.expectEqual(@as(usize, 1), records.records.len);
 }
 
 test "long format from README - generic data structures" {
@@ -1147,8 +1125,8 @@ test "long format from README - generic data structures" {
     var reader = std.Io.Reader.fixed(data);
     const records = try parse(&reader, allocator, .{});
     defer records.deinit();
-    try std.testing.expectEqual(@as(usize, 2), records.records.items.len);
-    const first = records.records.items[0];
+    try std.testing.expectEqual(@as(usize, 2), records.records.len);
+    const first = records.records[0];
     try std.testing.expectEqual(@as(usize, 6), first.fields.len);
     try std.testing.expectEqualStrings("key", first.fields[0].key);
     try std.testing.expectEqualStrings("string value, with any data except a \\n. an optional string length between the colons", first.fields[0].value.?.string);
@@ -1163,7 +1141,7 @@ test "long format from README - generic data structures" {
     try std.testing.expectEqualStrings("boolean value", first.fields[5].key);
     try std.testing.expect(!first.fields[5].value.?.boolean);
 
-    const second = records.records.items[1];
+    const second = records.records[1];
     try std.testing.expectEqual(@as(usize, 5), second.fields.len);
     try std.testing.expectEqualStrings("key", second.fields[0].key);
     try std.testing.expectEqualStrings("this is the second record", second.fields[0].value.?.string);
@@ -1190,8 +1168,8 @@ test "compact format from README - generic data structures" {
     // We want "parse" and "parseLeaky" probably. Second parameter is a diagnostics
     const records = try parse(&reader, allocator, .{});
     defer records.deinit();
-    try std.testing.expectEqual(@as(usize, 2), records.records.items.len);
-    const first = records.records.items[0];
+    try std.testing.expectEqual(@as(usize, 2), records.records.len);
+    const first = records.records[0];
     try std.testing.expectEqual(@as(usize, 6), first.fields.len);
     try std.testing.expectEqualStrings("key", first.fields[0].key);
     try std.testing.expectEqualStrings("string value must have a length between colons or end with a comma", first.fields[0].value.?.string);
@@ -1206,7 +1184,7 @@ test "compact format from README - generic data structures" {
     try std.testing.expectEqualStrings("boolean value", first.fields[5].key);
     try std.testing.expect(!first.fields[5].value.?.boolean);
 
-    const second = records.records.items[1];
+    const second = records.records[1];
     try std.testing.expectEqual(@as(usize, 1), second.fields.len);
     try std.testing.expectEqualStrings("key", second.fields[0].key);
     try std.testing.expectEqualStrings("this is the second record", second.fields[0].value.?.string);
@@ -1273,7 +1251,7 @@ test "format all the things" {
     var formatted_reader = std.Io.Reader.fixed(formatted);
     const parsed = try parse(&formatted_reader, std.testing.allocator, .{});
     defer parsed.deinit();
-    try std.testing.expectEqualDeep(records, parsed.records.items);
+    try std.testing.expectEqualDeep(records, parsed.records);
 
     const compact = try std.fmt.bufPrint(
         &buf,
@@ -1290,7 +1268,7 @@ test "format all the things" {
     var compact_reader = std.Io.Reader.fixed(compact);
     const parsed_compact = try parse(&compact_reader, std.testing.allocator, .{});
     defer parsed_compact.deinit();
-    try std.testing.expectEqualDeep(records, parsed_compact.records.items);
+    try std.testing.expectEqualDeep(records, parsed_compact.records);
 
     const expected_expires: i64 = 1772589213;
     const compact_expires = try std.fmt.bufPrint(
@@ -1309,7 +1287,7 @@ test "format all the things" {
     var expires_reader = std.Io.Reader.fixed(compact_expires);
     const parsed_expires = try parse(&expires_reader, std.testing.allocator, .{});
     defer parsed_expires.deinit();
-    try std.testing.expectEqualDeep(records, parsed_expires.records.items);
+    try std.testing.expectEqualDeep(records, parsed_expires.records);
     try std.testing.expectEqual(expected_expires, parsed_expires.expires.?);
 }
 test "serialize/deserialize" {
@@ -1355,11 +1333,11 @@ test "serialize/deserialize" {
     const parsed = try parse(&compact_reader, std.testing.allocator, .{});
     defer parsed.deinit();
 
-    const rec1 = try parsed.records.items[0].to(Data);
+    const rec1 = try parsed.records[0].to(Data);
     try std.testing.expectEqualStrings("bar", rec1.foo);
     try std.testing.expectEqual(@as(u8, 42), rec1.bar);
     try std.testing.expectEqual(@as(RecType, .foo), rec1.qux);
-    const rec4 = try parsed.records.items[3].to(Data);
+    const rec4 = try parsed.records[3].to(Data);
     try std.testing.expectEqualStrings("bar", rec4.foo);
     try std.testing.expectEqual(@as(u8, 42), rec4.bar);
     try std.testing.expectEqual(@as(RecType, .bar), rec4.qux.?);
@@ -1443,9 +1421,9 @@ test "unions" {
     const parsed = try parse(&compact_reader, std.testing.allocator, .{});
     defer parsed.deinit();
 
-    const rec1 = try parsed.records.items[0].to(MixedData);
+    const rec1 = try parsed.records[0].to(MixedData);
     try std.testing.expectEqualDeep(data[0], rec1);
-    const rec2 = try parsed.records.items[1].to(MixedData);
+    const rec2 = try parsed.records[1].to(MixedData);
     try std.testing.expectEqualDeep(data[1], rec2);
 }
 test "enums" {
@@ -1488,9 +1466,9 @@ test "enums" {
     const parsed = try parse(&compact_reader, std.testing.allocator, .{});
     defer parsed.deinit();
 
-    const rec1 = try parsed.records.items[0].to(Data);
+    const rec1 = try parsed.records[0].to(Data);
     try std.testing.expectEqualDeep(data[0], rec1);
-    const rec2 = try parsed.records.items[1].to(Data);
+    const rec2 = try parsed.records[1].to(Data);
     try std.testing.expectEqualDeep(data[1], rec2);
 
     const missing_tag =
@@ -1501,10 +1479,10 @@ test "enums" {
     var mt_reader = std.Io.Reader.fixed(missing_tag);
     const mt_parsed = try parse(&mt_reader, std.testing.allocator, .{});
     defer mt_parsed.deinit();
-    const mt_rec1 = try mt_parsed.records.items[0].to(Data);
+    const mt_rec1 = try mt_parsed.records[0].to(Data);
     try std.testing.expect(mt_rec1.data_type == null);
 
-    const mt_rec1_dt2 = try mt_parsed.records.items[0].to(Data2);
+    const mt_rec1_dt2 = try mt_parsed.records[0].to(Data2);
     try std.testing.expect(mt_rec1_dt2.data_type == .bar);
 }
 test "compact format length-prefixed string as last field" {
@@ -1520,8 +1498,8 @@ test "compact format length-prefixed string as last field" {
     var reader = std.Io.Reader.fixed(data);
     const records = try parse(&reader, allocator, .{});
     defer records.deinit();
-    try std.testing.expectEqual(@as(usize, 1), records.records.items.len);
-    const rec = records.records.items[0];
+    try std.testing.expectEqual(@as(usize, 1), records.records.len);
+    const rec = records.records[0];
     try std.testing.expectEqual(@as(usize, 2), rec.fields.len);
     try std.testing.expectEqualStrings("name", rec.fields[0].key);
     try std.testing.expectEqualStrings("alice", rec.fields[0].value.?.string);
