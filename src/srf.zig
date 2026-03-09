@@ -1316,6 +1316,28 @@ inline fn parseError(allocator: std.mem.Allocator, message: []const u8, state: *
         return ParseError.ParseFailed;
     }
 }
+
+// Test-only types extracted to module level so that their pub methods
+// (required by std.meta.hasMethod) do not appear in generated documentation.
+const TestRecType = enum {
+    foo,
+    bar,
+};
+const TestCustomType = struct {
+    const Self = @This();
+    pub fn srfParse(val: []const u8) !Self {
+        if (std.mem.eql(u8, "hi", val)) return .{};
+        return error.ValueNotEqualHi;
+    }
+    pub fn srfFormat(self: Self, allocator: std.mem.Allocator, comptime field_name: []const u8) !Value {
+        _ = self;
+        _ = field_name;
+        return .{
+            .string = try allocator.dupe(u8, "hi"),
+        };
+    }
+};
+
 test "long format single record, no eof" {
     const data =
         \\#!srfv1 # mandatory comment with format and version. Parser instructions start with #!
@@ -1550,33 +1572,13 @@ test "format all the things" {
     try std.testing.expectEqual(expected_expires, parsed_expires.expires.?);
 }
 test "serialize/deserialize" {
-    const RecType = enum {
-        foo,
-        bar,
-    };
-
-    const Custom = struct {
-        const Self = @This();
-        pub fn srfParse(val: []const u8) !Self {
-            if (std.mem.eql(u8, "hi", val)) return .{};
-            return error.ValueNotEqualHi;
-        }
-        pub fn srfFormat(self: Self, allocator: std.mem.Allocator, comptime field_name: []const u8) !Value {
-            _ = self;
-            _ = field_name;
-            return .{
-                .string = try allocator.dupe(u8, "hi"),
-            };
-        }
-    };
-
     const Data = struct {
         foo: []const u8,
         bar: u8,
-        qux: ?RecType = .foo,
+        qux: ?TestRecType = .foo,
         b: bool = false,
         f: f32 = 4.2,
-        custom: ?Custom = null,
+        custom: ?TestCustomType = null,
     };
 
     const compact =
@@ -1595,11 +1597,11 @@ test "serialize/deserialize" {
     const rec1 = try parsed.records[0].to(Data);
     try std.testing.expectEqualStrings("bar", rec1.foo);
     try std.testing.expectEqual(@as(u8, 42), rec1.bar);
-    try std.testing.expectEqual(@as(RecType, .foo), rec1.qux);
+    try std.testing.expectEqual(@as(TestRecType, .foo), rec1.qux);
     const rec4 = try parsed.records[3].to(Data);
     try std.testing.expectEqualStrings("bar", rec4.foo);
     try std.testing.expectEqual(@as(u8, 42), rec4.bar);
-    try std.testing.expectEqual(@as(RecType, .bar), rec4.qux.?);
+    try std.testing.expectEqual(@as(TestRecType, .bar), rec4.qux.?);
     try std.testing.expectEqual(true, rec4.b);
     try std.testing.expectEqual(@as(f32, 6.9), rec4.f);
 
@@ -1610,13 +1612,13 @@ test "serialize/deserialize" {
     const rec1_it = try (try ri.next()).?.to(Data);
     try std.testing.expectEqualStrings("bar", rec1_it.foo);
     try std.testing.expectEqual(@as(u8, 42), rec1_it.bar);
-    try std.testing.expectEqual(@as(RecType, .foo), rec1_it.qux);
+    try std.testing.expectEqual(@as(TestRecType, .foo), rec1_it.qux);
     _ = try ri.next();
     _ = try ri.next();
     const rec4_it = try (try ri.next()).?.to(Data);
     try std.testing.expectEqualStrings("bar", rec4_it.foo);
     try std.testing.expectEqual(@as(u8, 42), rec4_it.bar);
-    try std.testing.expectEqual(@as(RecType, .bar), rec4_it.qux.?);
+    try std.testing.expectEqual(@as(TestRecType, .bar), rec4_it.qux.?);
     try std.testing.expectEqual(true, rec4_it.b);
     try std.testing.expectEqual(@as(f32, 6.9), rec4_it.f);
 
@@ -1632,10 +1634,10 @@ test "serialize/deserialize" {
     // const Data = struct {
     //     foo: []const u8,
     //     bar: u8,
-    //     qux: ?RecType = .foo,
+    //     qux: ?TestRecType = .foo,
     //     b: bool = false,
     //     f: f32 = 4.2,
-    //     custom: ?Custom = null,
+    //     custom: ?TestCustomType = null,
     // };
     try std.testing.expectEqual(@as(usize, 6), record_4.fields.len);
 
