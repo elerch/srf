@@ -1740,6 +1740,36 @@ test "conversion from string true/false to proper type" {
     try std.testing.expect(!rec2.b);
     try std.testing.expectError(error.StringValueOfBooleanMustBetrueOrfalse, parsed.records[2].to(Data));
 }
+test "iterator with blank" {
+    const Data = struct {
+        foo: []const u8,
+        bar: u8,
+        qux: ?TestRecType = .foo,
+        b: bool = false,
+        f: f32 = 4.2,
+        custom: ?TestCustomType = null,
+    };
+    const compact =
+        \\#!srfv1
+        \\foo::1,bar:num:42
+        \\
+        \\# second record
+        \\
+        \\foo::2,bar:num:24
+        \\
+    ;
+    // Round trip and make sure we get equivalent objects back
+    var compact_reader = std.Io.Reader.fixed(compact);
+    const parsed = try parse(&compact_reader, std.testing.allocator, .{});
+    defer parsed.deinit();
+
+    const rec1 = try parsed.records[0].to(Data);
+    try std.testing.expectEqual('1', rec1.foo[0]);
+    try std.testing.expectEqual(@as(u8, 42), rec1.bar);
+    const rec2 = try parsed.records[1].to(Data);
+    try std.testing.expectEqual('2', rec2.foo[0]);
+    try std.testing.expectEqual(@as(u8, 24), rec2.bar);
+}
 test "unions" {
     const Foo = struct {
         number: u8,
