@@ -67,25 +67,43 @@ const ValueWithMetaData = struct {
     error_parsing: bool = false,
     reader_advanced: bool = false,
 };
+/// A parsed SRF value. Each field in a record has a key and an optional `Value`.
 pub const Value = union(enum) {
+    /// A numeric value, parsed from the `num` type hint.
     number: f64,
 
-    /// Bytes are converted to/from base64, string is not
+    /// Raw bytes decoded from base64, parsed from the `binary` type hint.
     bytes: []const u8,
 
-    /// String is not touched in any way
+    /// A string value, either delimiter-terminated or length-prefixed.
+    /// Not transformed during parsing (no escaping/unescaping), but will be
+    /// allocated if .alloc_strings = true is passed during parsing, or if
+    /// a multi-line string is found in the data
     string: []const u8,
 
+    /// A boolean value, parsed from the `bool` type hint (`true` or `false`).
     boolean: bool,
 
-    // pub fn format(self: Value, writer: *std.Io.Writer) std.Io.Writer.Error!void {
-    //     switch (self) {
-    //         .number => try writer.print("num: {d}", .{self.number}),
-    //         .bytes => try writer.print("bytes: {x}", .{self.bytes}),
-    //         .string => try writer.print("string: {s}", .{self.string}),
-    //         .boolean => try writer.print("boolean: {}", .{self.boolean}),
-    //     }
-    // }
+    /// parses a single srf value, without the key. The the whole field is:
+    ///
+    /// SRF Field: 'foo:3:bar'
+    ///
+    /// The value we expect to be sent to this function is:
+    ///
+    /// SRF Value: '3:bar'
+    ///
+    /// The value is allowed to have extra data...for instance, in compact format
+    /// the value above can be represented by:
+    ///
+    /// SRF Value: '3:bar,next_field::foobar'
+    ///
+    /// and the next field will be ignored
+    ///
+    /// This function may need to advance the reader in the case of multi-line
+    /// strings. It may also allocate data in the case of base64 (binary) values
+    /// as well as multi-line strings. Metadata is returned to assist in tracking
+    ///
+    /// This function is intended to be used by the SRF parser
     pub fn parse(allocator: std.mem.Allocator, str: []const u8, state: *RecordIterator.State, delimiter: u8) ParseError!ValueWithMetaData {
         const type_val_sep_raw = std.mem.indexOfScalar(u8, str, ':');
         if (type_val_sep_raw == null) {
@@ -244,22 +262,15 @@ pub const Value = union(enum) {
     }
 };
 
-// A field has a key and a value, but the value may be null
+/// A single key-value pair within a record. The key is always a string.
+/// The value may be `null` (from the `null` type hint) or one of the
+/// `Value` variants. Yielded by `RecordIterator.FieldIterator.next`.
 pub const Field = struct {
     key: []const u8,
     value: ?Value,
 };
 
 fn coerce(name: []const u8, comptime T: type, val: ?Value) !T {
-    // Here's the deduplicated set of field types that coerce needs to handle:
-    // Direct from SRF values:
-    // Need parsing from string:
-    // - Date, ?Date -- Date.parse(string)
-    //
-    // Won't work with Record.to(T) generically:
-    // - []const OptionContract -- nested sub-records (OptionsChain has calls/puts arrays)
-    // - ?[]const Holding, ?[]const SectorWeight -- nested sub-records in EtfProfile
-    //
     const ti = @typeInfo(T);
     if (val == null and ti != .optional)
         return error.NullValueCannotBeAssignedToNonNullField;
@@ -307,23 +318,31 @@ fn coerce(name: []const u8, comptime T: type, val: ?Value) !T {
     return null;
 }
 
-// A record has a list of fields, with no assumptions regarding duplication,
-// etc. This is for parsing speed, but also for more flexibility in terms of
-// use cases. One can make a defacto array out of this structure by having
-// something like:
-//
-// arr:string:foo
-// arr:string:bar
-//
-// and when you coerce to zig struct have an array .arr that gets populated
-// with strings "foo" and "bar".
+/// A record is an ordered list of `Field` values, with no uniqueness constraints
+/// on keys. This allows flexible use cases such as encoding arrays by repeating
+/// the same key. In long form, this could look like:
+///
+/// ```txt
+/// arr:string:foo
+/// arr:string:bar
+/// ```
+///
+/// Records are returned by the batch `parse` function. For streaming, prefer
+/// `iterator` which yields fields one at a time via `RecordIterator.FieldIterator`
+/// without collecting them into a slice.
 pub const Record = struct {
     fields: []const Field,
 
+    /// Returns a `RecordFormatter` suitable for use with `std.fmt.bufPrint`
+    /// or any `std.Io.Writer`. Use `FormatOptions` to control compact vs
+    /// long output format.
     pub fn fmt(value: Record, options: FormatOptions) RecordFormatter {
         return .{ .value = value, .options = options };
     }
 
+    /// Looks up the first `Field` whose key matches `field_name`, or returns
+    /// `null` if no such field exists. Only the first occurrence is returned;
+    /// duplicate keys are not considered.
     pub fn firstFieldByName(self: Record, field_name: []const u8) ?Field {
         for (self.fields) |f|
             if (std.mem.eql(u8, f.key, field_name)) return f;
@@ -501,7 +520,20 @@ pub const Record = struct {
         return OwnedRecord(T).init(allocator, val);
     }
 
-    /// Coerce Record to a type. Does not handle fields with arrays
+    /// Coerce a `Record` to a Zig struct or tagged union. For each field in `T`,
+    /// the first matching `Field` by name is coerced to the target type. Fields
+    /// with default values in `T` that are not present in the data use their
+    /// defaults. Missing fields without defaults return an error. Note that
+    /// by this logic, multiple fields with the same name will have all but the
+    /// first value silently ignored.
+    ///
+    /// For tagged unions, the active variant is determined by a field named
+    /// `"active_tag"` (or the value of `T.srf_tag_field` if declared). The
+    /// remaining fields are coerced into the payload struct of that variant.
+    ///
+    /// For streaming data without collecting fields first, prefer
+    /// `RecordIterator.FieldIterator.to` which avoids the intermediate
+    /// `[]Field` allocation entirely.
     pub fn to(self: Record, comptime T: type) !T {
         const ti = @typeInfo(T);
 
@@ -547,26 +579,39 @@ pub const Record = struct {
         }
         return error.CoercionNotPossible;
     }
+    test to {
+        // Example: coerce a batch-parsed Record into a Zig struct.
+        const Data = struct {
+            city: []const u8,
+            pop: u8,
+        };
+        const data =
+            \\#!srfv1
+            \\city::springfield,pop:num:30
+        ;
+        const allocator = std.testing.allocator;
+        var reader = std.Io.Reader.fixed(data);
+        const parsed = try parse(&reader, allocator, .{});
+        defer parsed.deinit();
+
+        const result = try parsed.records[0].to(Data);
+        try std.testing.expectEqualStrings("springfield", result.city);
+        try std.testing.expectEqual(@as(u8, 30), result.pop);
+    }
 };
 
-/// The Parsed struct is equivalent to Parsed(T) in std.json. Since most are
-/// familiar with std.json, it differs in the following ways:
+/// A streaming record iterator for parsing SRF data. This is the preferred
+/// parsing API because it avoids collecting all records and fields into memory
+/// at once. Created by calling `iterator`.
 ///
-/// * There is a records field instead of a value field. In json, one type of
-/// value is an array. SRF does not have an array data type, but the set of
-/// records is an array. json as a format is structred as a single object at
-/// the outermost
+/// Each call to `next` yields a `FieldIterator` for one record. Fields within
+/// that record are consumed lazily via `FieldIterator.next` or coerced directly
+/// into a Zig type via `FieldIterator.to`. All allocations go through an
+/// internal arena; call `deinit` to release everything when done.
 ///
-/// * This is not generic. In SRF, it is a separate function to bind the list
-/// of records to a specific data type. This will add some (hopefully minimal)
-/// overhead, but also avoid conflating parsing from the coercion from general
-/// type to specifics, and avoids answering questions like "what if I have
-/// 15 values for the same key" until you're actually dealing with that problem
-/// (see std.json.ParseOptions duplicate_field_behavior and ignore_unknown_fields)
-///
-/// When implemented, there will include a pub fn bind(self: Parsed, comptime T: type, options, BindOptions) BindError![]T
-/// function. The options will include things related to duplicate handling and
-/// missing fields
+/// If `RecordIterator.next` is called before the previous `FieldIterator` has
+/// been fully consumed, the remaining fields are automatically drained to keep
+/// the parser state consistent.
 pub const RecordIterator = struct {
     arena: *std.heap.ArenaAllocator,
     /// optional expiry time for the data. Useful for caching
@@ -611,9 +656,19 @@ pub const RecordIterator = struct {
         }
     };
 
+    /// Advances to the next record in the stream, returning a `FieldIterator`
+    /// for accessing its fields. Returns `null` when all records have been
+    /// consumed.
+    ///
+    /// If the previous `FieldIterator` was not fully drained, its remaining
+    /// fields are consumed automatically to keep the reader positioned
+    /// correctly. It is safe (but unnecessary) to fully consume the
+    /// `FieldIterator` before calling `next` again.
+    ///
+    /// Note that all state is stored in a shared area accessible to both
+    /// the `RecordIterator` and the `FieldIterator`, so there is no need to
+    /// store the return value as a variable
     pub fn next(self: RecordIterator) !?FieldIterator {
-        // TODO: we need to capture the fieldIterator here and make sure it's run
-        // to the ground to keep our state intact
         const state = self.state;
         if (state.field_iterator) |f| {
             // We need to finish the fields on the previous record
@@ -666,18 +721,24 @@ pub const RecordIterator = struct {
         return state.field_iterator.?;
     }
 
+    /// Iterates over the fields within a single record. Yielded by
+    /// `RecordIterator.next`. Each call to `next` returns the next `Field`
+    /// in the record, or `null` when the record boundary is reached.
+    ///
+    /// For direct type coercion without manually iterating fields, use `to`.
     pub const FieldIterator = struct {
         state: *State,
         arena: *std.heap.ArenaAllocator,
 
+        /// Returns the next `Field` in the current record, or `null` when
+        /// the record boundary has been reached. After `null` is returned,
+        /// subsequent calls continue to return `null`.
         pub fn next(self: FieldIterator) !?Field {
             const state = self.state;
             const aa = self.arena.allocator();
             // Main parsing. We already have the first line of data, which could
             // be a record (compact format) or a key/value pair (long format)
 
-            // log.debug("", .{});
-            log.debug("current line:{?s}", .{state.current_line});
             if (state.current_line == null) return null;
             if (state.end_of_record_reached) return null;
             // non-blank line, but we could have an eof marker
@@ -771,7 +832,21 @@ pub const RecordIterator = struct {
             return field;
         }
 
-        /// Coerce Record to a type. Does not handle fields with arrays
+        /// Consumes remaining fields in this record and coerces them into a
+        /// Zig struct or tagged union `T`. This is the streaming equivalent of
+        /// `Record.to` -- it performs the same field-name matching and default
+        /// value logic, but reads directly from the parser without building an
+        /// intermediate `[]Field` slice.
+        ///
+        /// For structs, fields are matched by name. Only the first occurrence
+        /// of each field name is used; duplicates are ignored. Fields in `T`
+        /// that have default values and are not present in the data use those
+        /// defaults. Missing fields without defaults return an error.
+        ///
+        /// For tagged unions, the active tag field must appear first in the
+        /// stream (unlike `Record.to` which can do random access). The tag
+        /// field name defaults to `"active_tag"` or `T.srf_tag_field` if
+        /// declared.
         pub fn to(self: FieldIterator, comptime T: type) !T {
             const ti = @typeInfo(T);
 
@@ -847,13 +922,47 @@ pub const RecordIterator = struct {
             }
             return error.CoercionNotPossible;
         }
+        test to {
+            // Example: coerce fields directly into a Zig struct from the iterator,
+            // without collecting into an intermediate Record. This is the most
+            // allocation-efficient path for typed deserialization.
+            const Data = struct {
+                name: []const u8,
+                score: u8,
+                active: bool = true,
+            };
+            const data =
+                \\#!srfv1
+                \\name::alice,score:num:99
+            ;
+            const allocator = std.testing.allocator;
+            var reader = std.Io.Reader.fixed(data);
+            var ri = try iterator(&reader, allocator, .{});
+            defer ri.deinit();
+
+            const result = try (try ri.next()).?.to(Data);
+            try std.testing.expectEqualStrings("alice", result.name);
+            try std.testing.expectEqual(@as(u8, 99), result.score);
+            // `active` was not in the data, so the default value is used
+            try std.testing.expect(result.active);
+        }
     };
+    /// Releases all memory owned by this iterator. This frees the internal
+    /// arena (and all parsed data allocated from it), then frees the arena
+    /// struct itself. After calling `deinit`, any slices or string pointers
+    /// obtained from `FieldIterator.next` or `FieldIterator.to` are invalid.
     pub fn deinit(self: RecordIterator) void {
         const child_allocator = self.arena.child_allocator;
         self.arena.deinit();
         child_allocator.destroy(self.arena);
     }
 
+    /// Returns `true` if the data has not expired based on the `#!expires`
+    /// directive. If no expiry was specified, the data is always considered
+    /// fresh. Callers should check this after parsing to decide whether to
+    /// use or refresh cached data. Note that data will be returned by parse/
+    /// iterator regardless of freshness. This enables callers to use cached
+    /// data temporarily while refreshing it
     pub fn isFresh(self: RecordIterator) bool {
         if (self.expires) |exp|
             return std.time.timestamp() < exp;
@@ -861,8 +970,25 @@ pub const RecordIterator = struct {
         // no expiry: always fresh, never frozen
         return true;
     }
+    test isFresh {
+        // Example: check expiry on parsed data. Data without an #!expires
+        // directive is always considered fresh.
+        const data =
+            \\#!srfv1
+            \\key::value
+        ;
+        const allocator = std.testing.allocator;
+        var reader = std.Io.Reader.fixed(data);
+        var ri = try iterator(&reader, allocator, .{});
+        defer ri.deinit();
+
+        // No expiry set, so always fresh
+        try std.testing.expect(ri.isFresh());
+    }
 };
 
+/// Options controlling SRF parsing behavior. Passed to both `iterator` and
+/// `parse`.
 pub const ParseOptions = struct {
     diagnostics: ?*Diagnostics = null,
 
@@ -903,7 +1029,12 @@ const Directive = union(enum) {
         return null;
     }
 };
+/// Options controlling SRF output formatting. Used by `fmt`, `fmtFrom`,
+/// `Record.fmt`, and related formatters.
 pub const FormatOptions = struct {
+    /// When `true`, fields are separated by newlines and records by blank
+    /// lines (`#!long` format). When `false` (default), fields are
+    /// comma-separated and records are newline-separated (compact format).
     long_format: bool = false,
 
     /// Will emit the eof directive as well as requireeof
@@ -918,14 +1049,19 @@ pub const FormatOptions = struct {
     emit_directives: bool = true,
 };
 
-/// Returns a formatter that formats the given value
+/// Returns a `Formatter` for writing pre-built `Record` values to a writer.
+/// Suitable for use with `std.fmt.bufPrint` or any `std.Io.Writer` via the
+/// `{f}` format specifier.
 pub fn fmt(value: []const Record, options: FormatOptions) Formatter {
     return .{ .value = value, .options = options };
 }
-/// Returns a formatter that formats the given value. This will take a concrete
-/// type, convert it to the SRF record format automatically (using srfFormat if
-/// found), and output to the writer. It is recommended to use a FixedBufferAllocator
-/// for the allocator, which is only used for custom srfFormat functions (I think - what about enum tag names?)
+/// Returns a formatter for writing typed Zig values directly to SRF format.
+/// Each value is converted to a `Record` via `Record.from` and written to
+/// the output. Custom serialization is supported via the `srfFormat` method
+/// convention on struct/union fields.
+///
+/// The `allocator` is used only for fields that require custom formatting
+/// (via `srfFormat`). A `FixedBufferAllocator` is recommended for this purpose.
 pub fn fmtFrom(comptime T: type, allocator: std.mem.Allocator, value: []const T, options: FormatOptions) FromFormatter(T) {
     return .{ .value = value, .options = options, .allocator = allocator };
 }
@@ -1033,11 +1169,20 @@ pub const RecordFormatter = struct {
     }
 };
 
+/// The result of a batch `parse` call. Contains all records collected into a
+/// single slice. All data is owned by the internal arena; call `deinit` to
+/// release everything.
+///
+/// For streaming without collecting all records, prefer `iterator` which
+/// returns a `RecordIterator` instead.
 pub const Parsed = struct {
     records: []Record,
     arena: *std.heap.ArenaAllocator,
     expires: ?i64,
 
+    /// Releases all memory owned by this `Parsed` result, including all
+    /// record and field data. After calling `deinit`, any slices or string
+    /// pointers obtained from `records` are invalid.
     pub fn deinit(self: Parsed) void {
         const ca = self.arena.child_allocator;
         self.arena.deinit();
@@ -1045,7 +1190,15 @@ pub const Parsed = struct {
     }
 };
 
-/// parse function
+/// Parses all records from the reader into memory, returning a `Parsed` struct
+/// with a `records` slice. This is a convenience wrapper around `iterator` that
+/// collects all fields and records into arena-allocated slices.
+///
+/// For most use cases, prefer `iterator` instead -- it streams records lazily
+/// and avoids the cost of collecting all fields into intermediate `ArrayList`s.
+///
+/// All returned data is owned by the `Parsed` arena. Call `Parsed.deinit` to
+/// free everything at once.
 pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: ParseOptions) ParseError!Parsed {
     var records = std.ArrayList(Record).empty;
     var it = try iterator(reader, allocator, options);
@@ -1073,7 +1226,21 @@ pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: Pars
     };
 }
 
-/// Gets an iterator to stream through the data
+/// Creates a streaming `RecordIterator` for the given reader. This is the
+/// preferred entry point for parsing SRF data, as it yields records and
+/// fields lazily without collecting them into slices.
+///
+/// The returned iterator owns an arena allocator that holds all parsed data
+/// (string values, keys, etc.). Call `RecordIterator.deinit` to free
+/// everything when done. Parsed field data remains valid until `deinit` is
+/// called.
+///
+/// The iterator handles SRF header directives (`#!srfv1`, `#!long`,
+/// `#!compact`, `#!requireeof`, `#!expires`) automatically during
+/// construction. Notably this means you can check isFresh() immediately.
+///
+/// Also note that as state is allocated and stored within the recorditerator,
+/// callers can assign the return value to a constant
 pub fn iterator(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: ParseOptions) ParseError!RecordIterator {
 
     // The arena and state are heap-allocated because RecordIterator is returned
@@ -1615,11 +1782,10 @@ test "compact format length-prefixed string as last field" {
     try std.testing.expectEqualStrings("desc", rec.fields[1].key);
     try std.testing.expectEqualStrings("world", rec.fields[1].value.?.string);
 }
-test "iterator" {
-    // When a length-prefixed value is the last field on the line,
-    // rest_of_data.len == size exactly. The check on line 216 uses
-    // strict > instead of >=, falling through to the multi-line path
-    // where size - rest_of_data.len - 1 underflows.
+test iterator {
+    // Example: streaming through records and fields using the iterator API.
+    // This is the preferred parsing approach -- no intermediate slices are
+    // allocated for fields or records.
     const data =
         \\#!srfv1
         \\name::alice,desc:5:world
@@ -1629,21 +1795,65 @@ test "iterator" {
     var ri = try iterator(&reader, allocator, .{});
     defer ri.deinit();
 
-    const nfi = try ri.next();
-    try std.testing.expect(nfi != null);
-    const fi = nfi.?;
-    // defer fi.deinit();
-    const field1 = try fi.next();
-    try std.testing.expect(field1 != null);
-    try std.testing.expectEqualStrings("name", field1.?.key);
-    try std.testing.expectEqualStrings("alice", field1.?.value.?.string);
-    const field2 = try fi.next();
-    try std.testing.expect(field2 != null);
-    try std.testing.expectEqualStrings("desc", field2.?.key);
-    try std.testing.expectEqualStrings("world", field2.?.value.?.string);
-    const field3 = try fi.next();
-    try std.testing.expect(field3 == null);
+    // Advance to the first (and only) record
+    const fi = (try ri.next()).?;
 
-    const next = try ri.next();
-    try std.testing.expect(next == null);
+    // Iterate fields within the record
+    const field1 = (try fi.next()).?;
+    try std.testing.expectEqualStrings("name", field1.key);
+    try std.testing.expectEqualStrings("alice", field1.value.?.string);
+    const field2 = (try fi.next()).?;
+    try std.testing.expectEqualStrings("desc", field2.key);
+    try std.testing.expectEqualStrings("world", field2.value.?.string);
+
+    // No more fields in this record
+    try std.testing.expect(try fi.next() == null);
+    // No more records
+    try std.testing.expect(try ri.next() == null);
+}
+test parse {
+    // Example: batch parsing collects all records and fields into slices.
+    // Prefer `iterator` for streaming; use `parse` when random access to
+    // all records is needed.
+    const data =
+        \\#!srfv1
+        \\#!long
+        \\name::alice
+        \\age:num:30
+        \\
+        \\name::bob
+        \\age:num:25
+        \\#!eof
+    ;
+    const allocator = std.testing.allocator;
+    var reader = std.Io.Reader.fixed(data);
+    const parsed = try parse(&reader, allocator, .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), parsed.records.len);
+    try std.testing.expectEqualStrings("alice", parsed.records[0].fields[0].value.?.string);
+    try std.testing.expectEqualStrings("bob", parsed.records[1].fields[0].value.?.string);
+}
+test fmtFrom {
+    // Example: serialize typed Zig values directly to SRF format.
+    const Data = struct {
+        name: []const u8,
+        age: u8,
+    };
+    const values: []const Data = &.{
+        .{ .name = "alice", .age = 30 },
+        .{ .name = "bob", .age = 25 },
+    };
+    var buf: [4096]u8 = undefined;
+    const result = try std.fmt.bufPrint(
+        &buf,
+        "{f}",
+        .{fmtFrom(Data, std.testing.allocator, values, .{})},
+    );
+    try std.testing.expectEqualStrings(
+        \\#!srfv1
+        \\name::alice,age:num:30
+        \\name::bob,age:num:25
+        \\
+    , result);
 }

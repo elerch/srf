@@ -4,10 +4,12 @@ SRF is a minimal data format designed for L2 caches and simple structured storag
 
 **Features:**
 - No escaping required - use length-prefixed strings for complex data
-- Single-pass parsing with minimal memory allocation
+- Single-pass streaming parser with minimal memory allocation
 - Basic type system (string, num, bool, null, binary) with explicit type hints
 - Compact format for machine generation, long format for human editing
 - Built-in corruption detection with optional EOF markers
+- Iterator-based API for zero-copy, low-allocation streaming
+- Comptime type coercion directly from the iterator (no intermediate collections)
 
 **When to use SRF:**
 - L2 caches that need occasional human inspection
@@ -20,7 +22,70 @@ SRF is a minimal data format designed for L2 caches and simple structured storag
 - Schema validation requirements
 - Arrays or object hierarchies (arrays can be managed in the data itself, however)
 
-Long format:
+## Parsing API
+
+SRF provides two parsing APIs. The **iterator API is preferred** for most use cases
+as it avoids collecting all records and fields into memory at once.
+
+### Iterator (preferred)
+
+The `iterator` function returns a `RecordIterator` that streams records lazily.
+Each call to `RecordIterator.next` yields a `FieldIterator` for the next record,
+and each call to `FieldIterator.next` yields individual `Field` values. No
+intermediate slices or ArrayLists are allocated -- fields are yielded one at a
+time directly from the parser state.
+
+For type coercion, `FieldIterator.to(T)` consumes the remaining fields in the
+current record and maps them into a Zig struct or tagged union at comptime,
+with zero additional allocations beyond what field parsing itself requires. This
+can further be minimized with the parsing option `.alloc_strings = false`.
+
+```zig
+const srf = @import("srf");
+
+const Data = struct {
+    name: []const u8,
+    age: u8,
+    active: bool = false,
+};
+
+var reader = std.Io.Reader.fixed(raw_data);
+var ri = try srf.iterator(&reader, allocator, .{});
+defer ri.deinit();
+
+while (try ri.next()) |fi| {
+    const record = try fi.to(Data);
+    // process record...
+}
+```
+
+### Batch parse
+
+The `parse` function collects all records into memory at once, returning a
+`Parsed` struct with a `records: []Record` slice. This is built on top of
+the iterator internally. It is convenient when you need random access to all
+records, but costs more memory since every field is collected into ArrayLists
+before being converted to owned slices.
+
+```zig
+const srf = @import("srf");
+
+var reader = std.Io.Reader.fixed(raw_data);
+const parsed = try srf.parse(&reader, allocator, .{});
+defer parsed.deinit();
+
+for (parsed.records) |record| {
+    const data = try record.to(Data);
+    // process data...
+}
+```
+
+## Data Formats
+
+### Long format
+
+Long format uses newlines to delimit fields and blank lines to separate records.
+It is human-friendly and suitable for hand-edited configuration files.
 
 ```
 #!srfv1 # mandatory comment with format and version. Parser instructions start with #!
@@ -46,13 +111,49 @@ data with newlines must have a length::single line
 #!eof # eof marker, useful to make sure your file wasn't cut in half. Only considered if requireeof set at top
 ```
 
-compact format:
+### Compact format
+
+Compact format uses commas to delimit fields and newlines to separate records.
+It is designed for machine generation where space efficiency matters.
+
 ```
 #!srfv1 # mandatory comment with format and version. Parser instructions start with #!
 key::string value must have a length between colons or end with a comma,this is a number:num:5 ,null value:null:,array::array's don't exist. Use json or toml or something,data with newlines must have a length:7:foo
 bar,boolean value:bool:false
 key::this is the second record
 ```
+
+## Serialization
+
+SRF supports serializing Zig structs, unions, and enums back to SRF format.
+Use `Record.from` to create a record from a typed value, or `fmtFrom` to
+format a slice of values directly to a writer.
+
+```zig
+const srf = @import("srf");
+
+const all_data: []const Data = &.{
+    .{ .name = "alice", .age = 30, .active = true },
+    .{ .name = "bob", .age = 25 },
+};
+var buf: [4096]u8 = undefined;
+const formatted = try std.fmt.bufPrint(&buf, "{f}", .{
+    srf.fmtFrom(Data, allocator, all_data, .{ .long_format = true }),
+});
+```
+
+## Type System
+
+Fields follow the format `key:type_hint:value`:
+
+| Type                   | Hint                  | Example                 |
+|------------------------|-----------------------|-------------------------|
+| String                 | *(empty)* or `string` | `name::alice`           |
+| Number (internally f64)| `num`                 | `age:num:30`            |
+| Boolean                | `bool`                | `active:bool:true`      |
+| Null                   | `null`                | `missing:null:`         |
+| Binary                 | `binary`              | `data:binary:base64...` |
+| Length-prefixed string | *(byte count)*        | `bio:12:hello\nworld!`  |
 
 ## Implementation Concerns
 
@@ -87,5 +188,5 @@ key::this is the second record
 
 ## AI Use
 
-AI was used in this project for comments, parts of the README, and unit test
-generation. All other code is human generated.
+AI was used in this project for comments, parts of the README, benchmarking code,
+build.zig and unit test generation. All other code is human generated.
