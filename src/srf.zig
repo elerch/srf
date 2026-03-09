@@ -619,6 +619,16 @@ pub const RecordIterator = struct {
     /// to the caller to check is_fresh and determine the right thing to do
     expires: ?i64,
 
+    /// optional created time for the data. This library does nothing with
+    /// this data, but will be tracked and available immediately after calling
+    /// `iterator` if needed/provided
+    created: ?i64,
+
+    /// optional modified time for the data. This library does nothing with
+    /// this data, but will be tracked and available immediately after calling
+    /// `iterator` if needed/provided
+    modified: ?i64,
+
     state: *State,
 
     pub const State = struct {
@@ -1006,6 +1016,8 @@ const Directive = union(enum) {
     require_eof,
     eof,
     expires: i64,
+    created: i64,
+    modified: i64,
 
     pub fn parse(allocator: std.mem.Allocator, str: []const u8, state: *RecordIterator.State) ParseError!?Directive {
         if (!std.mem.startsWith(u8, str, "#!")) return null;
@@ -1023,8 +1035,12 @@ const Directive = union(enum) {
         if (std.mem.eql(u8, "long", line)) return .long_format;
         if (std.mem.startsWith(u8, line, "expires=")) {
             return .{ .expires = std.fmt.parseInt(i64, line["expires=".len..], 10) catch return ParseError.ParseFailed };
-            // try parseError(allocator, options, "#!requireof found. Did you mean #!requireeof?", state);
-            // return null;
+        }
+        if (std.mem.startsWith(u8, line, "created=")) {
+            return .{ .created = std.fmt.parseInt(i64, line["created=".len..], 10) catch return ParseError.ParseFailed };
+        }
+        if (std.mem.startsWith(u8, line, "modified=")) {
+            return .{ .modified = std.fmt.parseInt(i64, line["modified=".len..], 10) catch return ParseError.ParseFailed };
         }
         return null;
     }
@@ -1178,7 +1194,19 @@ pub const RecordFormatter = struct {
 pub const Parsed = struct {
     records: []Record,
     arena: *std.heap.ArenaAllocator,
+
+    /// optional expiry time for the data. Useful for caching
+    /// Note that on a parse, data will always be returned and it will be up
+    /// to the caller to check is_fresh and determine the right thing to do
     expires: ?i64,
+
+    /// optional created time for the data. This library does nothing with
+    /// this data, but will be tracked and available
+    created: ?i64,
+
+    /// optional modified time for the data. This library does nothing with
+    /// this data, but will be tracked and available
+    modified: ?i64,
 
     /// Releases all memory owned by this `Parsed` result, including all
     /// record and field data. After calling `deinit`, any slices or string
@@ -1223,6 +1251,8 @@ pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: Pars
         .records = try records.toOwnedSlice(aa),
         .arena = it.arena,
         .expires = it.expires,
+        .created = it.created,
+        .modified = it.modified,
     };
 }
 
@@ -1265,6 +1295,8 @@ pub fn iterator(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: P
     var it: RecordIterator = .{
         .arena = arena,
         .expires = null,
+        .created = null,
+        .modified = null,
         .state = state,
     };
     const first_line = it.state.nextLine() orelse return ParseError.ParseFailed;
@@ -1283,6 +1315,8 @@ pub fn iterator(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: P
                     .compact_format => it.state.field_delimiter = ',', // what if we have both?
                     .require_eof => it.state.require_eof = true,
                     .expires => |exp| it.expires = exp,
+                    .created => |exp| it.created = exp,
+                    .modified => |exp| it.modified = exp,
                     .eof => {
                         // there needs to be an eof then
                         if (it.state.nextLine()) |_| {
