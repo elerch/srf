@@ -589,6 +589,7 @@ pub const RecordIterator = struct {
 
         field_delimiter: u8 = ',',
         end_of_record_reached: bool = false,
+        field_iterator: ?FieldIterator = null,
 
         /// Takes the next line, trimming leading whitespace and ignoring comments
         /// Directives (comments starting with #!) are preserved
@@ -614,6 +615,11 @@ pub const RecordIterator = struct {
         // TODO: we need to capture the fieldIterator here and make sure it's run
         // to the ground to keep our state intact
         const state = self.state;
+        if (state.field_iterator) |f| {
+            // We need to finish the fields on the previous record
+            while (try f.next()) |_| {}
+            state.field_iterator = null;
+        }
         if (state.current_line == null) {
             if (state.options.diagnostics) |d|
                 if (d.errors.items.len > 0) return ParseError.ParseFailed;
@@ -653,7 +659,8 @@ pub const RecordIterator = struct {
             }
         }
         state.end_of_record_reached = false;
-        return .{ .ri = self };
+        state.field_iterator = .{ .ri = self };
+        return state.field_iterator.?;
     }
 
     pub const FieldIterator = struct {
