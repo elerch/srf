@@ -155,6 +155,95 @@ Fields follow the format `key:type_hint:value`:
 | Binary                 | `binary`              | `data:binary:base64...` |
 | Length-prefixed string | *(byte count)*        | `bio:12:hello\nworld!`  |
 
+## Directives
+
+Directives are parser instructions that appear at the top of an SRF file. They
+use the `#!` prefix and must appear before any data records (except `#!eof`,
+which marks the end of data). Inline comments are allowed after directives.
+Unrecognized directives are silently ignored for forward compatibility.
+
+| Directive                  | Parameters       | Description                                          |
+|----------------------------|------------------|------------------------------------------------------|
+| `#!srfv1`                  | none             | Magic header identifying the file as SRF version 1   |
+| `#!long`                   | none             | Select long format (newline-delimited fields)         |
+| `#!compact`                | none             | Select compact format (comma-delimited fields)        |
+| `#!requireeof`             | none             | Require `#!eof` marker or parsing fails               |
+| `#!eof`                    | none             | End-of-file marker for corruption detection           |
+| `#!expires=<unix_ts>`      | `i64` timestamp  | Cache expiration time (checked via `isFresh()`)       |
+| `#!created=<unix_ts>`      | `i64` timestamp  | Data creation timestamp (metadata only)               |
+| `#!modified=<unix_ts>`     | `i64` timestamp  | Data modification timestamp (metadata only)           |
+
+### `#!srfv1`
+
+Mandatory magic header that must appear on the very first line of every SRF
+file. Identifies the file format and version. A missing header causes a parse
+error; duplicates are also rejected.
+
+### `#!long`
+
+Selects long format mode where fields are delimited by newlines and records are
+separated by blank lines. Suitable for hand-edited configuration files. Mutually
+exclusive with `#!compact`.
+
+### `#!compact`
+
+Selects compact format mode where fields are delimited by commas and records are
+separated by newlines. This is the default format, so the directive is optional.
+Designed for machine generation where space efficiency matters.
+
+### `#!requireeof`
+
+When present, parsing will fail if the `#!eof` marker is not found at the end of
+the file. This is a corruption detection mechanism to ensure the file was not
+truncated during a write.
+
+### `#!eof`
+
+Marks the end of SRF data. Any data appearing after this directive causes a
+parse error. Can appear in the header (indicating an empty file) or after data
+records. Paired with `#!requireeof` for corruption detection.
+
+### `#!expires=<unix_timestamp>`
+
+Sets a cache expiration timestamp. The value is a Unix timestamp (seconds since
+epoch) as an `i64`. The `RecordIterator.isFresh()` method checks this against
+the current time. Data is always returned regardless of freshness -- callers
+decide whether to use stale data.
+
+```
+#!srfv1
+#!expires=1772589213
+key::cached_value
+```
+
+### `#!created=<unix_timestamp>`
+
+Records when the data was created. The value is a Unix timestamp as an `i64`.
+This is metadata only -- the library tracks it but takes no action on it.
+Available on the iterator/parsed result immediately after construction.
+
+### `#!modified=<unix_timestamp>`
+
+Records when the data was last modified. The value is a Unix timestamp as an
+`i64`. Like `#!created`, this is metadata only and is available on the
+iterator/parsed result after construction.
+
+### Example with multiple directives
+
+```
+#!srfv1
+#!requireeof
+#!long
+#!expires=1772589213
+#!created=1772500000
+name::alice
+age:num:30
+
+name::bob
+age:num:25
+#!eof
+```
+
 ## Implementation Concerns
 
 **Parser robustness:**
