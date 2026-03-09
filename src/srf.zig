@@ -250,6 +250,63 @@ pub const Field = struct {
     value: ?Value,
 };
 
+fn coerce(name: []const u8, comptime T: type, val: ?Value) !T {
+    // Here's the deduplicated set of field types that coerce needs to handle:
+    // Direct from SRF values:
+    // Need parsing from string:
+    // - Date, ?Date -- Date.parse(string)
+    //
+    // Won't work with Record.to(T) generically:
+    // - []const OptionContract -- nested sub-records (OptionsChain has calls/puts arrays)
+    // - ?[]const Holding, ?[]const SectorWeight -- nested sub-records in EtfProfile
+    //
+    const ti = @typeInfo(T);
+    if (val == null and ti != .optional)
+        return error.NullValueCannotBeAssignedToNonNullField;
+
+    // []const u8 is classified as a pointer
+    switch (ti) {
+        .optional => |o| if (val) |_|
+            return try coerce(name, o.child, val)
+        else
+            return null,
+        .pointer => |p| {
+            // We don't have an allocator, so the only thing we can do
+            // here is manage []const u8 or []u8
+            if (p.size != .slice or p.child != u8)
+                return error.CoercionNotPossible;
+            if (val.? != .string and val.? != .bytes)
+                return error.CoercionNotPossible;
+            if (val.? == .string)
+                return val.?.string;
+            return val.?.bytes;
+        },
+        .type, .void, .noreturn => return error.CoercionNotPossible,
+        .comptime_float, .comptime_int, .undefined, .null, .error_union => return error.CoercionNotPossible,
+        .error_set, .@"fn", .@"opaque", .frame => return error.CoercionNotPossible,
+        .@"anyframe", .vector, .enum_literal => return error.CoercionNotPossible,
+        .int => return @as(T, @intFromFloat(val.?.number)),
+        .float => return @as(T, @floatCast(val.?.number)),
+        .bool => return val.?.boolean,
+        .@"enum" => return std.meta.stringToEnum(T, val.?.string).?,
+        .array => return error.NotImplemented,
+        .@"struct", .@"union" => {
+            if (std.meta.hasMethod(T, "srfParse")) {
+                if (val.? == .string)
+                    return T.srfParse(val.?.string) catch |e| {
+                        log.err(
+                            "custom parse of value {s} failed : {}",
+                            .{ val.?.string, e },
+                        );
+                        return error.CustomParseFailed;
+                    };
+            }
+            return error.CoercionNotPossible;
+        },
+    }
+    return null;
+}
+
 // A record has a list of fields, with no assumptions regarding duplication,
 // etc. This is for parsing speed, but also for more flexibility in terms of
 // use cases. One can make a defacto array out of this structure by having
@@ -270,63 +327,6 @@ pub const Record = struct {
     pub fn firstFieldByName(self: Record, field_name: []const u8) ?Field {
         for (self.fields) |f|
             if (std.mem.eql(u8, f.key, field_name)) return f;
-        return null;
-    }
-
-    fn coerce(name: []const u8, comptime T: type, val: ?Value) !T {
-        // Here's the deduplicated set of field types that coerce needs to handle:
-        // Direct from SRF values:
-        // Need parsing from string:
-        // - Date, ?Date -- Date.parse(string)
-        //
-        // Won't work with Record.to(T) generically:
-        // - []const OptionContract -- nested sub-records (OptionsChain has calls/puts arrays)
-        // - ?[]const Holding, ?[]const SectorWeight -- nested sub-records in EtfProfile
-        //
-        const ti = @typeInfo(T);
-        if (val == null and ti != .optional)
-            return error.NullValueCannotBeAssignedToNonNullField;
-
-        // []const u8 is classified as a pointer
-        switch (ti) {
-            .optional => |o| if (val) |_|
-                return try coerce(name, o.child, val)
-            else
-                return null,
-            .pointer => |p| {
-                // We don't have an allocator, so the only thing we can do
-                // here is manage []const u8 or []u8
-                if (p.size != .slice or p.child != u8)
-                    return error.CoercionNotPossible;
-                if (val.? != .string and val.? != .bytes)
-                    return error.CoercionNotPossible;
-                if (val.? == .string)
-                    return val.?.string;
-                return val.?.bytes;
-            },
-            .type, .void, .noreturn => return error.CoercionNotPossible,
-            .comptime_float, .comptime_int, .undefined, .null, .error_union => return error.CoercionNotPossible,
-            .error_set, .@"fn", .@"opaque", .frame => return error.CoercionNotPossible,
-            .@"anyframe", .vector, .enum_literal => return error.CoercionNotPossible,
-            .int => return @as(T, @intFromFloat(val.?.number)),
-            .float => return @as(T, @floatCast(val.?.number)),
-            .bool => return val.?.boolean,
-            .@"enum" => return std.meta.stringToEnum(T, val.?.string).?,
-            .array => return error.NotImplemented,
-            .@"struct", .@"union" => {
-                if (std.meta.hasMethod(T, "srfParse")) {
-                    if (val.? == .string)
-                        return T.srfParse(val.?.string) catch |e| {
-                            log.err(
-                                "custom parse of value {s} failed : {}",
-                                .{ val.?.string, e },
-                            );
-                            return error.CustomParseFailed;
-                        };
-                }
-                return error.CoercionNotPossible;
-            },
-        }
         return null;
     }
 
@@ -766,8 +766,84 @@ pub const RecordIterator = struct {
             }
             return field;
         }
-    };
 
+        /// Coerce Record to a type. Does not handle fields with arrays
+        pub fn to(self: FieldIterator, comptime T: type) !T {
+            const ti = @typeInfo(T);
+
+            switch (ti) {
+                .@"struct" => {
+                    // What is this magic? The FieldEnum creates a type (an enum)
+                    // where each enum member has the name of a field in the struct
+                    //
+                    // So... struct { a: u8, b: u8 } will yield enum { a, b }
+                    const FieldEnum = std.meta.FieldEnum(T);
+                    // Then...EnumFieldStruct will create a struct from this, where
+                    // each enum value becomes a field. We will specify the field
+                    // type, and the default value. Combining these two calls gets
+                    // us a struct with all the same field names, but we get a chance
+                    // to make all the fields boolean, so we can use it to track
+                    // which fields have been set
+                    var found: std.enums.EnumFieldStruct(FieldEnum, bool, false) = .{};
+                    // SAFETY: all fields updated below or error is returned
+                    var obj: T = undefined;
+
+                    while (try self.next()) |f| {
+                        inline for (std.meta.fields(T)) |type_field| {
+                            // To replicate the behavior of the record version of to,
+                            // we need to only take the first version of the field,
+                            // so if it's specified twice in the data, we will ignore
+                            // all but the first instance
+                            if (std.mem.eql(u8, f.key, type_field.name) and
+                                !@field(found, type_field.name))
+                            {
+                                @field(obj, type_field.name) =
+                                    try coerce(type_field.name, type_field.type, f.value);
+                                // Now account for this in our magic found struct...
+                                @field(found, type_field.name) = true;
+                            }
+                        }
+                    }
+                    // Fill in the defaults for remaining fields. Throw if anything
+                    // is missing both value (from above) and default (from here)
+                    inline for (std.meta.fields(T)) |type_field| {
+                        if (!@field(found, type_field.name)) {
+                            // We did not find this field above...revert to default value
+                            if (type_field.default_value_ptr) |ptr| {
+                                @field(obj, type_field.name) = @as(*const type_field.type, @ptrCast(@alignCast(ptr))).*;
+                            } else {
+                                log.debug("Record could not be coerced. Field {s} not found on srf data, and no default value exists on the type", .{type_field.name});
+                                return error.FieldNotFoundOnFieldWithoutDefaultValue;
+                            }
+                        }
+                    }
+                    return obj;
+                },
+                .@"union" => {
+                    const active_tag_name = if (@hasDecl(T, "srf_tag_field"))
+                        T.srf_tag_field
+                    else
+                        "active_tag";
+                    const first_try = try self.next();
+                    if (first_try == null) return error.ActiveTagFieldNotFound;
+                    const f = first_try.?;
+                    if (!std.mem.eql(u8, f.key, active_tag_name))
+                        return error.ActiveTagNotFirstField; // required here, but not on the Record version of to
+                    if (f.value == null or f.value.? != .string)
+                        return error.ActiveTagValueMustBeAString;
+                    const active_tag = f.value.?.string;
+                    inline for (std.meta.fields(T)) |field_type| {
+                        if (std.mem.eql(u8, active_tag, field_type.name)) {
+                            return @unionInit(T, field_type.name, try self.to(field_type.type));
+                        }
+                    }
+                    return error.ActiveTagDoesNotExist;
+                },
+                else => @compileError("Deserialization not supported on " ++ @tagName(ti) ++ " types"),
+            }
+            return error.CoercionNotPossible;
+        }
+    };
     pub fn deinit(self: RecordIterator) void {
         const child_allocator = self.arena.child_allocator;
         self.arena.deinit();
@@ -1350,6 +1426,23 @@ test "serialize/deserialize" {
     try std.testing.expectEqual(@as(RecType, .bar), rec4.qux.?);
     try std.testing.expectEqual(true, rec4.b);
     try std.testing.expectEqual(@as(f32, 6.9), rec4.f);
+
+    // Now we'll do it with the iterator version
+    var it_reader = std.Io.Reader.fixed(compact);
+    const ri = try iterator(&it_reader, std.testing.allocator, .{});
+    defer ri.deinit();
+    const rec1_it = try (try ri.next()).?.to(Data);
+    try std.testing.expectEqualStrings("bar", rec1_it.foo);
+    try std.testing.expectEqual(@as(u8, 42), rec1_it.bar);
+    try std.testing.expectEqual(@as(RecType, .foo), rec1_it.qux);
+    _ = try ri.next();
+    _ = try ri.next();
+    const rec4_it = try (try ri.next()).?.to(Data);
+    try std.testing.expectEqualStrings("bar", rec4_it.foo);
+    try std.testing.expectEqual(@as(u8, 42), rec4_it.bar);
+    try std.testing.expectEqual(@as(RecType, .bar), rec4_it.qux.?);
+    try std.testing.expectEqual(true, rec4_it.b);
+    try std.testing.expectEqual(@as(f32, 6.9), rec4_it.f);
 
     const alloc = std.testing.allocator;
     var owned_record_1 = try Record.from(Data, alloc, rec1);
