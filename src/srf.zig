@@ -659,16 +659,20 @@ pub const RecordIterator = struct {
             }
         }
         state.end_of_record_reached = false;
-        state.field_iterator = .{ .ri = self };
+        state.field_iterator = .{
+            .state = self.state,
+            .arena = self.arena,
+        };
         return state.field_iterator.?;
     }
 
     pub const FieldIterator = struct {
-        ri: RecordIterator,
+        state: *State,
+        arena: *std.heap.ArenaAllocator,
 
         pub fn next(self: FieldIterator) !?Field {
-            const state = self.ri.state;
-            const aa = self.ri.arena.allocator();
+            const state = self.state;
+            const aa = self.arena.allocator();
             // Main parsing. We already have the first line of data, which could
             // be a record (compact format) or a key/value pair (long format)
 
@@ -1072,7 +1076,12 @@ pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: Pars
 /// Gets an iterator to stream through the data
 pub fn iterator(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: ParseOptions) ParseError!RecordIterator {
 
-    // TODO: What can we do about allocations here?
+    // The arena and state are heap-allocated because RecordIterator is returned
+    // by value. Both RecordIterator and FieldIterator must share mutable state,
+    // so State is held by pointer to ensure mutations propagate across copies.
+    // The arena pointer serves the same purpose -- an inline arena would be
+    // duplicated on copy, creating dangling pointers. These are O(1) per parse
+    // session (not per-record or per-field), so the cost is negligible.
 
     // create an arena allocator for everytyhing related to parsing
     const arena: *std.heap.ArenaAllocator = try allocator.create(std.heap.ArenaAllocator);
