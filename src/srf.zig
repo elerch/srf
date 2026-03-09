@@ -298,7 +298,16 @@ fn coerce(name: []const u8, comptime T: type, val: ?Value) !T {
         .@"anyframe", .vector, .enum_literal => return error.CoercionNotPossible,
         .int => return @as(T, @intFromFloat(val.?.number)),
         .float => return @as(T, @floatCast(val.?.number)),
-        .bool => return val.?.boolean,
+        .bool => return switch (val.?) {
+            .boolean => |b| b,
+            .string => |s| if (std.mem.eql(u8, "true", s))
+                true
+            else if (std.mem.eql(u8, "false", s))
+                false
+            else
+                error.StringValueOfBooleanMustBetrueOrfalse,
+            else => error.BooleanNotBooleanOrString,
+        },
         .@"enum" => return std.meta.stringToEnum(T, val.?.string).?,
         .array => return error.NotImplemented,
         .@"struct", .@"union" => {
@@ -1703,6 +1712,33 @@ test "serialize/deserialize" {
         \\
     ;
     try std.testing.expectEqualStrings(expect, compact_from);
+}
+test "conversion from string true/false to proper type" {
+    const Data = struct {
+        foo: []const u8,
+        bar: u8,
+        qux: ?TestRecType = .foo,
+        b: bool = false,
+        f: f32 = 4.2,
+        custom: ?TestCustomType = null,
+    };
+    const compact =
+        \\#!srfv1
+        \\foo::bar,foo:null:,foo:binary:YmFy,foo:num:42,bar:num:42,qux::bar,b::true,f:num:6.9,custom:string:hi
+        \\foo::bar,foo:null:,foo:binary:YmFy,foo:num:42,bar:num:42,qux::bar,b::false,f:num:6.9,custom:string:hi
+        \\foo::bar,foo:null:,foo:binary:YmFy,foo:num:42,bar:num:42,qux::bar,b::noneoftheabove,f:num:6.9,custom:string:hi
+        \\
+    ;
+    // Round trip and make sure we get equivalent objects back
+    var compact_reader = std.Io.Reader.fixed(compact);
+    const parsed = try parse(&compact_reader, std.testing.allocator, .{});
+    defer parsed.deinit();
+
+    const rec1 = try parsed.records[0].to(Data);
+    try std.testing.expect(rec1.b);
+    const rec2 = try parsed.records[1].to(Data);
+    try std.testing.expect(!rec2.b);
+    try std.testing.expectError(error.StringValueOfBooleanMustBetrueOrfalse, parsed.records[2].to(Data));
 }
 test "unions" {
     const Foo = struct {
