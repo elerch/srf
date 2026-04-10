@@ -32,27 +32,57 @@ pub const ParseLineError = struct {
     }
 };
 pub const Diagnostics = struct {
-    errors: *std.ArrayList(ParseLineError),
-    stop_after: usize = 10,
-    arena: std.heap.ArenaAllocator,
+    ptr: *anyopaque,
+    addErrorFn: *const fn (*anyopaque, std.mem.Allocator, ParseLineError) ParseError!void,
+    has_errors: bool = false,
 
-    pub fn addError(self: Diagnostics, allocator: std.mem.Allocator, err: ParseLineError) ParseError!void {
-        if (self.errors.items.len >= self.stop_after) {
-            err.deinit(allocator);
-            return ParseError.ParseFailed;
-        }
-        try self.errors.append(allocator, err);
-    }
-    pub fn deinit(self: Diagnostics) void {
-        // From parse, three things can happen:
-        // 1. Happy path - record comes back, deallocation happens on that deinit
-        // 2. Errors is returned, no diagnostics provided. Deallocation happens in parse on errdefer
-        // 3. Errors are returned, diagnostics provided. Deallocation happens here
-        const child_allocator = self.arena.child_allocator;
-        self.arena.deinit();
-        child_allocator.destroy(self.arena);
+    pub fn addError(self: *Diagnostics, allocator: std.mem.Allocator, err: ParseLineError) ParseError!void {
+        try self.addErrorFn(self.ptr, allocator, err);
+        self.has_errors = true;
     }
 };
+pub fn BoundedDiagnostics(comptime max_errors: usize) type {
+    return struct {
+        buffer: [max_errors]ParseLineError,
+        capacity: usize = max_errors,
+        error_count: usize = 0,
+
+        const Self = @This();
+
+        pub const empty: Self = .{
+            // SAFETY: buffer is managed through addError below
+            .buffer = undefined,
+        };
+
+        pub fn diagnostics(self: *Self) Diagnostics {
+            return .{
+                .ptr = self,
+                .addErrorFn = addDiagnosticsError,
+            };
+        }
+        fn addDiagnosticsError(ptr: *anyopaque, allocator: std.mem.Allocator, err: ParseLineError) ParseError!void {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            try self.addError(allocator, err);
+        }
+        pub fn addError(self: *Self, allocator: std.mem.Allocator, err: ParseLineError) ParseError!void {
+            if (self.error_count >= self.capacity) {
+                err.deinit(allocator);
+                return ParseError.ParseFailed;
+            }
+            self.buffer[self.error_count] = err;
+            self.error_count += 1;
+        }
+        pub fn errors(self: Self) []const ParseLineError {
+            return self.buffer[0..self.error_count];
+        }
+
+        /// Must be called to deallocate the diagnostic messages
+        pub fn deinit(self: *Self, allocator: std.mem.Allocator) void {
+            for (self.errors()) |e| e.deinit(allocator);
+            self.error_count = 0;
+        }
+    };
+}
 
 pub const ParseError = error{
     ParseFailed,
@@ -104,10 +134,10 @@ pub const Value = union(enum) {
     /// as well as multi-line strings. Metadata is returned to assist in tracking
     ///
     /// This function is intended to be used by the SRF parser
-    pub fn parse(allocator: std.mem.Allocator, str: []const u8, state: *RecordIterator.State, delimiter: u8) ParseError!ValueWithMetaData {
+    pub fn parse(allocator: std.mem.Allocator, err_allocator: std.mem.Allocator, str: []const u8, state: *RecordIterator.State, delimiter: u8) ParseError!ValueWithMetaData {
         const type_val_sep_raw = std.mem.indexOfScalar(u8, str, ':');
         if (type_val_sep_raw == null) {
-            try parseError(allocator, "no type data or value after key", state);
+            try parseError(err_allocator, "no type data or value after key", state);
             return ParseError.ParseFailed;
         }
 
@@ -137,7 +167,7 @@ pub const Value = union(enum) {
             state.partial_line_column += total_chars;
             const Decoder = std.base64.standard.Decoder;
             const size = Decoder.calcSizeForSlice(val) catch {
-                try parseError(allocator, "error parsing base64 value", state);
+                try parseError(err_allocator, "error parsing base64 value", state);
                 return .{
                     .item_value = null,
                     .error_parsing = true,
@@ -146,7 +176,7 @@ pub const Value = union(enum) {
             const data = try allocator.alloc(u8, size);
             errdefer allocator.free(data);
             Decoder.decode(data, val) catch {
-                try parseError(allocator, "error parsing base64 value", state);
+                try parseError(err_allocator, "error parsing base64 value", state);
                 allocator.free(data);
                 return .{
                     .item_value = null,
@@ -167,7 +197,7 @@ pub const Value = union(enum) {
             state.partial_line_column += total_chars;
             const val_trimmed = std.mem.trim(u8, val, &std.ascii.whitespace);
             const number = std.fmt.parseFloat(@FieldType(Value, "number"), val_trimmed) catch {
-                try parseError(allocator, "error parsing numeric value", state);
+                try parseError(err_allocator, "error parsing numeric value", state);
                 return .{
                     .item_value = null,
                     .error_parsing = true,
@@ -189,7 +219,7 @@ pub const Value = union(enum) {
                 if (std.mem.eql(u8, "false", val_trimmed)) break :blk false;
                 if (std.mem.eql(u8, "true", val_trimmed)) break :blk true;
 
-                try parseError(allocator, "error parsing boolean value", state);
+                try parseError(err_allocator, "error parsing boolean value", state);
                 return .{
                     .item_value = null,
                     .error_parsing = true,
@@ -216,7 +246,7 @@ pub const Value = union(enum) {
         state.partial_line_column += total_metadata_chars;
         const size = std.fmt.parseInt(usize, trimmed_meta, 0) catch {
             log.debug("parseInt fail, trimmed_data: '{s}'", .{trimmed_meta});
-            try parseError(allocator, "unrecognized metadata for key", state);
+            try parseError(err_allocator, "unrecognized metadata for key", state);
             return .{
                 .item_value = null,
                 .error_parsing = true,
@@ -696,7 +726,7 @@ pub const RecordIterator = struct {
         }
         if (state.current_line == null) {
             if (state.options.diagnostics) |d|
-                if (d.errors.items.len > 0) return ParseError.ParseFailed;
+                if (d.has_errors) return ParseError.ParseFailed;
             if (state.require_eof and !state.eof_found) return ParseError.ParseFailed;
             return null;
         }
@@ -710,12 +740,12 @@ pub const RecordIterator = struct {
             if (state.current_line == null) return self.next();
         }
         // non-blank line, but we could have an eof marker
-        if (try Directive.parse(self.arena.allocator(), state.current_line.?, state)) |d| {
+        if (try Directive.parse(self.arena.child_allocator, state.current_line.?, state)) |d| {
             switch (d) {
                 .eof => {
                     // there needs to be an eof then
                     if (state.nextLine()) |_| {
-                        try parseError(self.arena.allocator(), "Data found after #!eof", state);
+                        try parseError(self.arena.child_allocator, "Data found after #!eof", state);
                         return ParseError.ParseFailed; // this is terminal
                     } else {
                         state.eof_found = true;
@@ -724,7 +754,7 @@ pub const RecordIterator = struct {
                     }
                 },
                 else => {
-                    try parseError(self.arena.allocator(), "Directive found after data started", state);
+                    try parseError(self.arena.child_allocator, "Directive found after data started", state);
                     state.current_line = state.nextLine();
                     // TODO: This runs the risk of a malicious file creating
                     // a stackoverflow by using many non-eof directives
@@ -762,12 +792,12 @@ pub const RecordIterator = struct {
             if (state.end_of_record_reached) return null;
             // non-blank line, but we could have an eof marker
             // TODO: deduplicate this code
-            if (try Directive.parse(aa, state.current_line.?, state)) |d| {
+            if (try Directive.parse(self.arena.child_allocator, state.current_line.?, state)) |d| {
                 switch (d) {
                     .eof => {
                         // there needs to be an eof then
                         if (state.nextLine()) |_| {
-                            try parseError(aa, "Data found after #!eof", state);
+                            try parseError(self.arena.child_allocator, "Data found after #!eof", state);
                             return ParseError.ParseFailed; // this is terminal
                         } else {
                             state.eof_found = true;
@@ -776,7 +806,7 @@ pub const RecordIterator = struct {
                         }
                     },
                     else => {
-                        try parseError(aa, "Directive found after data started", state);
+                        try parseError(self.arena.child_allocator, "Directive found after data started", state);
                         state.current_line = state.nextLine();
                         // TODO: This runs the risk of a malicious file creating
                         // a stackoverflow by using many non-eof directives
@@ -794,6 +824,7 @@ pub const RecordIterator = struct {
             state.partial_line_column += key.len + 1;
             const value = try Value.parse(
                 aa,
+                self.arena.child_allocator,
                 it.rest(),
                 state,
                 state.field_delimiter,
@@ -1009,6 +1040,7 @@ pub const RecordIterator = struct {
 /// Options controlling SRF parsing behavior. Passed to both `iterator` and
 /// `parse`.
 pub const ParseOptions = struct {
+    /// diagnostics should be a struct provided by Diagnostics function
     diagnostics: ?*Diagnostics = null,
 
     /// By default, the parser will copy data so it is safe to free the original
@@ -1028,6 +1060,9 @@ const Directive = union(enum) {
     created: i64,
     modified: i64,
 
+    /// Parses a Directive. The only reason the allocator is used here is because
+    /// a parse error may be logged, so this function should *NOT* be called
+    /// with an arena allocator
     pub fn parse(allocator: std.mem.Allocator, str: []const u8, state: *RecordIterator.State) ParseError!?Directive {
         if (!std.mem.startsWith(u8, str, "#!")) return null;
         // strip any comments off
@@ -1320,16 +1355,16 @@ pub fn iterator(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: P
     };
     const first_line = it.state.nextLine() orelse return ParseError.ParseFailed;
 
-    if (try Directive.parse(aa, first_line, it.state)) |d| {
+    if (try Directive.parse(allocator, first_line, it.state)) |d| {
         if (d != .magic) try parseError(aa, "Magic header not found on first line", it.state);
-    } else try parseError(aa, "Magic header not found on first line", it.state);
+    } else try parseError(allocator, "Magic header not found on first line", it.state);
 
     // Loop through the header material and configure our main parsing
     it.state.current_line = blk: {
         while (it.state.nextLine()) |line| {
-            if (try Directive.parse(aa, line, it.state)) |d| {
+            if (try Directive.parse(allocator, line, it.state)) |d| {
                 switch (d) {
-                    .magic => try parseError(aa, "Found a duplicate magic header", it.state),
+                    .magic => try parseError(allocator, "Found a duplicate magic header", it.state),
                     .long_format => it.state.field_delimiter = '\n',
                     .compact_format => it.state.field_delimiter = ',', // what if we have both?
                     .require_eof => it.state.require_eof = true,
@@ -1339,7 +1374,7 @@ pub fn iterator(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: P
                     .eof => {
                         // there needs to be an eof then
                         if (it.state.nextLine()) |_| {
-                            try parseError(aa, "Data found after #!eof", it.state);
+                            try parseError(allocator, "Data found after #!eof", it.state);
                             return ParseError.ParseFailed; // this is terminal
                         } else return it;
                     },
@@ -1356,11 +1391,14 @@ inline fn dupe(allocator: std.mem.Allocator, options: ParseOptions, data: []cons
         return try allocator.dupe(u8, data);
     return data;
 }
+/// Logs a parse error to diagnostics. Note that the allocator provided should
+/// *NOT* be an arena, as the message must outlive the parse results, which will
+/// be otherwise cleaned up in the arena deinit
 inline fn parseError(allocator: std.mem.Allocator, message: []const u8, state: *RecordIterator.State) ParseError!void {
     log.debug("Parse error. Parse state {f}, message: {s}", .{ state, message });
     if (state.options.diagnostics) |d| {
         try d.addError(allocator, .{
-            .message = try dupe(allocator, state.options, message),
+            .message = try allocator.dupe(u8, message),
             .level = .err,
             .line = state.line,
             .column = state.column,
@@ -1939,7 +1977,12 @@ test parse {
     ;
     const allocator = std.testing.allocator;
     var reader = std.Io.Reader.fixed(data);
-    const parsed = try parse(&reader, allocator, .{});
+    // Diagnostics are optional, but if you would like them, include
+    // these three lines and set the options field:
+    var diags: BoundedDiagnostics(10) = .empty;
+    defer diags.deinit(allocator);
+    var diag: Diagnostics = diags.diagnostics();
+    const parsed = try parse(&reader, allocator, .{ .diagnostics = &diag });
     defer parsed.deinit();
 
     try std.testing.expectEqual(@as(usize, 2), parsed.records.len);
@@ -1968,4 +2011,39 @@ test fmtFrom {
         \\name::bob,age:num:25
         \\
     , result);
+}
+test "parse with diagnostics" {
+    // Example: batch parsing collects all records and fields into slices.
+    // Prefer `iterator` for streaming; use `parse` when random access to
+    // all records is needed.
+    const data =
+        \\#!srfv1
+        \\#!long
+        \\name:num:alice
+        \\age:num:30
+        \\
+        \\name::bob
+        \\age:num:25
+        \\#!eof
+    ;
+    const allocator = std.testing.allocator;
+    var reader = std.Io.Reader.fixed(data);
+    var diags: BoundedDiagnostics(10) = .empty;
+    defer diags.deinit(allocator);
+    var diag: Diagnostics = diags.diagnostics();
+    try std.testing.expectError(
+        ParseError.ParseFailed,
+        parse(&reader, allocator, .{ .diagnostics = &diag }),
+    );
+    const errors = diags.errors();
+    try std.testing.expectEqual(@as(usize, 1), errors.len);
+    const first = errors[0];
+    try std.testing.expectEqual(@as(usize, 3), first.line);
+    // TODO: this is at the end of the line. I'm not sure what the actual column
+    // should be here, but it's probably not that. Maybe at the beginning of
+    // "alice", which would be column 10?
+    try std.testing.expectEqual(@as(usize, 15), first.column);
+    try std.testing.expectEqualStrings("error parsing numeric value", first.message);
+    // const second = errors[1];
+    // try std.testing.expectEqualStrings("yo", second.message);
 }
