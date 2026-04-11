@@ -1356,7 +1356,7 @@ pub fn iterator(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: P
     const first_line = it.state.nextLine() orelse return ParseError.ParseFailed;
 
     if (try Directive.parse(allocator, first_line, it.state)) |d| {
-        if (d != .magic) try parseError(aa, "Magic header not found on first line", it.state);
+        if (d != .magic) try parseError(allocator, "Magic header not found on first line", it.state);
     } else try parseError(allocator, "Magic header not found on first line", it.state);
 
     // Loop through the header material and configure our main parsing
