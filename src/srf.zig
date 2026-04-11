@@ -1336,9 +1336,9 @@ pub fn iterator(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: P
 
     // create an arena allocator for everytyhing related to parsing
     const arena: *std.heap.ArenaAllocator = try allocator.create(std.heap.ArenaAllocator);
-    errdefer if (options.diagnostics == null) allocator.destroy(arena);
+    errdefer allocator.destroy(arena);
     arena.* = .init(allocator);
-    errdefer if (options.diagnostics == null) arena.deinit();
+    errdefer arena.deinit();
     const aa = arena.allocator();
     const state = try aa.create(RecordIterator.State);
     state.* = .{
