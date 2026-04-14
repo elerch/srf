@@ -250,6 +250,7 @@ const BenchmarkStep = struct {
         const b = step.owner;
         const self: *BenchmarkStep = @fieldParentPtr("step", step);
 
+        const io = b.graph.io;
         const gen_path = b.getInstallPath(.bin, self.gen_exe.name);
         const exe_path = b.getInstallPath(.bin, self.srf_exe.name);
         const count_str = b.fmt("{d}", .{self.record_count});
@@ -271,29 +272,32 @@ const BenchmarkStep = struct {
 
             const hash_str = b.fmt("{x}", .{hash});
             const cache_dir = b.cache_root.join(b.allocator, &.{ "o", hash_str }) catch @panic("OOM");
-            std.fs.cwd().makePath(cache_dir) catch {};
+            b.cache_root.handle.createDirPath(io, cache_dir) catch @panic("Could not create cache path");
 
             const filename = b.fmt("test-{s}.{s}", .{ fmt.name, fmt.ext });
             const filepath = b.pathJoin(&.{ cache_dir, filename });
             test_files[i] = filepath;
 
             // Check if file exists
-            if (std.fs.cwd().access(filepath, .{})) {
+            if (b.cache_root.handle.access(io, filepath, .{})) {
                 continue; // File exists, skip generation
             } else |_| {}
 
             // Generate file
-            var child = std.process.Child.init(&.{ gen_path, fmt.name, count_str }, b.allocator);
-            child.stdout_behavior = .Pipe;
-            try child.spawn();
+            var child = try std.process.spawn(io, .{
+                .argv = &.{ gen_path, fmt.name, count_str },
+                .stdout = .pipe,
+            });
 
-            const output = try child.stdout.?.readToEndAlloc(b.allocator, 100 * 1024 * 1024);
+            var buf: [4096]u8 = undefined;
+            var file_reader = child.stdout.?.reader(io, &buf);
+            var reader = &file_reader.interface;
+            const output = try reader.allocRemaining(b.allocator, .unlimited);
             defer b.allocator.free(output);
+            const term = try child.wait(io);
+            if (term != .exited or term.exited != 0) return error.GenerationFailed;
 
-            const term = try child.wait();
-            if (term != .Exited or term.Exited != 0) return error.GenerationFailed;
-
-            try std.fs.cwd().writeFile(.{ .sub_path = filepath, .data = output });
+            try b.cache_root.handle.writeFile(io, .{ .sub_path = filepath, .data = output });
         }
 
         // Run hyperfine
@@ -308,16 +312,19 @@ const BenchmarkStep = struct {
             try argv.append(b.allocator, b.fmt("{s} jsonl <{s}", .{ exe_path, test_files[2] }));
         }
 
-        var child = std.process.Child.init(argv.items, b.allocator);
-
         // We need to lock stderror so hyperfine can output progress in place
-        std.debug.lockStdErr();
-        defer std.debug.unlockStdErr();
+        // SAFETY: buffer for locking
+        var buf: [1024]u8 = undefined; // I have no idea what the right size buffer should be
+        _ = try io.lockStderr(&buf, null);
+        defer io.unlockStderr();
 
-        try child.spawn();
-        const term = try child.wait();
+        var child = try std.process.spawn(io, .{
+            .argv = argv.items,
+        });
 
-        if (term != .Exited or term.Exited != 0)
+        const term = try child.wait(io);
+
+        if (term != .exited or term.exited != 0)
             return error.BenchmarkFailed;
     }
 };

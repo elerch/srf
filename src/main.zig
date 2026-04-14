@@ -46,13 +46,10 @@ const CountingAllocator = struct {
     }
 };
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const base_allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const gpa = init.gpa;
 
-    const args = try std.process.argsAlloc(base_allocator);
-    defer std.process.argsFree(base_allocator, args);
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     if (args.len < 2) {
         std.debug.print("Usage: {s} <srf|json|jsonl>\n", .{args[0]});
@@ -61,19 +58,19 @@ pub fn main() !void {
 
     const format = args[1];
 
-    const debug_allocs = std.process.hasEnvVarConstant("DEBUG_ALLOCATIONS");
+    const debug_allocs = init.environ_map.contains("DEBUG_ALLOCATIONS");
 
-    var counting = CountingAllocator{ .child_allocator = base_allocator };
-    const allocator = if (debug_allocs) counting.allocator() else base_allocator;
+    var counting = CountingAllocator{ .child_allocator = gpa };
+    const allocator = if (debug_allocs) counting.allocator() else gpa;
 
     var stdin_buffer: [1024]u8 = undefined;
-    var stdin_reader = std.fs.File.stdin().reader(&stdin_buffer);
+    var stdin_reader = std.Io.File.stdin().reader(init.io, &stdin_buffer);
     const stdin = &stdin_reader.interface;
 
     // Load all data into memory first for fair comparison
     var data: std.ArrayList(u8) = .empty;
-    defer data.deinit(base_allocator);
-    try stdin.appendRemaining(base_allocator, &data, @enumFromInt(100 * 1024 * 1024));
+    defer data.deinit(gpa);
+    try stdin.appendRemaining(gpa, &data, @enumFromInt(100 * 1024 * 1024));
 
     if (std.mem.eql(u8, format, "srf")) {
         var reader = std.Io.Reader.fixed(data.items);

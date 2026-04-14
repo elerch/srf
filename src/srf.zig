@@ -1018,9 +1018,9 @@ pub const RecordIterator = struct {
     /// use or refresh cached data. Note that data will be returned by parse/
     /// iterator regardless of freshness. This enables callers to use cached
     /// data temporarily while refreshing it
-    pub fn isFresh(self: RecordIterator) bool {
+    pub fn isFresh(self: RecordIterator, io: std.Io) bool {
         if (self.expires) |exp|
-            return std.time.timestamp() < exp;
+            return std.Io.Timestamp.now(io, .real).toSeconds() < exp;
 
         // no expiry: always fresh, never frozen
         return true;
@@ -1038,7 +1038,7 @@ pub const RecordIterator = struct {
         defer ri.deinit();
 
         // No expiry set, so always fresh
-        try std.testing.expect(ri.isFresh());
+        try std.testing.expect(ri.isFresh(std.testing.io));
     }
 };
 
