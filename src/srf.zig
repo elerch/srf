@@ -512,7 +512,7 @@ pub const Record = struct {
                         const key = if (@hasDecl(U, "srf_tag_field"))
                             U.srf_tag_field
                         else
-                            "active_tag";
+                            "type";
                         self.fields_buf[inx] = .{
                             .key = key,
                             .value = .{ .string = active_tag_name },
@@ -573,7 +573,7 @@ pub const Record = struct {
     /// first value silently ignored.
     ///
     /// For tagged unions, the active variant is determined by a field named
-    /// `"active_tag"` (or the value of `T.srf_tag_field` if declared). The
+    /// `"type"` (or the value of `T.srf_tag_field` if declared). The
     /// remaining fields are coerced into the payload struct of that variant.
     ///
     /// For streaming data without collecting fields first, prefer
@@ -607,7 +607,7 @@ pub const Record = struct {
                 const active_tag_name = if (@hasDecl(T, "srf_tag_field"))
                     T.srf_tag_field
                 else
-                    "active_tag";
+                    "type";
                 if (self.firstFieldByName(active_tag_name)) |srf_field| {
                     if (srf_field.value == null or srf_field.value.? != .string)
                         return error.ActiveTagValueMustBeAString;
@@ -900,7 +900,7 @@ pub const RecordIterator = struct {
         ///
         /// For tagged unions, the active tag field must appear first in the
         /// stream (unlike `Record.to` which can do random access). The tag
-        /// field name defaults to `"active_tag"` or `T.srf_tag_field` if
+        /// field name defaults to `"type"` or `T.srf_tag_field` if
         /// declared.
         pub fn to(self: FieldIterator, comptime T: type) !T {
             const ti = @typeInfo(T);
@@ -957,7 +957,7 @@ pub const RecordIterator = struct {
                     const active_tag_name = if (@hasDecl(T, "srf_tag_field"))
                         T.srf_tag_field
                     else
-                        "active_tag";
+                        "type";
                     const first_try = try self.next();
                     if (first_try == null) return error.ActiveTagFieldNotFound;
                     const f = first_try.?;
@@ -1842,8 +1842,8 @@ test "unions" {
     );
     const expect =
         \\#!srfv1
-        \\active_tag::foo,number:num:42,true_or_false:bool:true
-        \\active_tag::bar,sentence::foobar,decimal:num:6.9
+        \\type::foo,number:num:42,true_or_false:bool:true
+        \\type::bar,sentence::foobar,decimal:num:6.9
         \\
     ;
     try std.testing.expectEqualStrings(expect, compact_from);
