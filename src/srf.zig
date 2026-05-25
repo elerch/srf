@@ -412,6 +412,7 @@ pub const Record = struct {
             fields_allocated: [fields_len]bool = .{false} ** fields_len,
             allocator: std.mem.Allocator,
             source_value: T,
+            format_options: FormatOptions,
             cached_record: ?Record = null,
 
             const Self = @This();
@@ -419,12 +420,13 @@ pub const Record = struct {
 
             pub const SourceType = T;
 
-            pub fn init(allocator: std.mem.Allocator, source: T) Self {
+            pub fn init(allocator: std.mem.Allocator, source: T, options: FormatOptions) Self {
                 return .{
                     // SAFETY: fields_buf is set by record() and is guarded by fields_set
                     .fields_buf = undefined,
                     .allocator = allocator,
                     .source_value = source,
+                    .format_options = options,
                 };
             }
 
@@ -442,7 +444,7 @@ pub const Record = struct {
             ) !usize {
                 if (default_value_ptr) |d| {
                     const default_val: *const field_type = @ptrCast(@alignCast(d));
-                    if (std.meta.eql(val, default_val.*)) return inx;
+                    if (!self.format_options.emit_default_values and std.meta.eql(val, default_val.*)) return inx;
                 }
                 const value = try self.formatField(field_type, field_name, val);
                 self.fields_buf[inx] = .{
@@ -562,7 +564,13 @@ pub const Record = struct {
     ///
     /// Call `deinit()` to free any allocations made for custom-formatted fields.
     pub fn from(comptime T: type, allocator: std.mem.Allocator, val: T) !OwnedRecord(T) {
-        return OwnedRecord(T).init(allocator, val);
+        return OwnedRecord(T).init(allocator, val, .{});
+    }
+
+    /// Internal function to allow an OwnedRecord to see format options necessary
+    /// to emit default values
+    fn fromWithOptions(comptime T: type, allocator: std.mem.Allocator, val: T, options: FormatOptions) !OwnedRecord(T) {
+        return OwnedRecord(T).init(allocator, val, options);
     }
 
     /// Coerce a `Record` to a Zig struct or tagged union. For each field in `T`,
@@ -1118,6 +1126,9 @@ pub const FormatOptions = struct {
     /// and just format the record. This is useful for appending to an existing
     /// srf file rather than overwriting all the data
     emit_directives: bool = true,
+
+    /// When set to true, this will output all values, even if they are the default values
+    emit_default_values: bool = false,
 };
 
 /// Returns a `Formatter` for writing pre-built `Record` values to a writer.
@@ -1150,7 +1161,12 @@ pub fn FromFormatter(comptime T: type) type {
             for (self.value) |item| {
                 if (!first and self.options.long_format) try writer.writeByte('\n');
                 first = false;
-                var owned_record = Record.from(T, self.allocator, item) catch
+                var owned_record = Record.fromWithOptions(
+                    T,
+                    self.allocator,
+                    item,
+                    self.options,
+                ) catch
                     return std.Io.Writer.Error.WriteFailed;
                 defer owned_record.deinit();
                 const record = owned_record.record() catch return std.Io.Writer.Error.WriteFailed;
@@ -2035,6 +2051,27 @@ test "fmtFrom commas" {
     try std.testing.expectEqualStrings(
         \\#!srfv1
         \\name:9:alice, yo,age:num:30
+        \\
+    , result);
+}
+test "fmtFrom outputs defaults with option" {
+    // Example: serialize typed Zig values directly to SRF format.
+    const Data = struct {
+        name: []const u8 = "bob",
+        age: u8,
+    };
+    const values: []const Data = &.{
+        .{ .age = 30 },
+    };
+    var buf: [4096]u8 = undefined;
+    const result = try std.fmt.bufPrint(
+        &buf,
+        "{f}",
+        .{fmtFrom(Data, std.testing.allocator, values, .{ .emit_default_values = true })},
+    );
+    try std.testing.expectEqualStrings(
+        \\#!srfv1
+        \\name::bob,age:num:30
         \\
     , result);
 }
