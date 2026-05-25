@@ -1226,8 +1226,9 @@ pub const RecordFormatter = struct {
                 switch (f.value.?) {
                     .string => |s| {
                         const newlines = std.mem.containsAtLeastScalar(u8, s, 1, '\n');
+                        const commas = !self.options.long_format and std.mem.containsAtLeastScalar(u8, s, 1, ',');
                         // Output the count if newlines exist
-                        const count = if (newlines) s.len else null;
+                        const count = if (newlines or commas) s.len else null;
                         if (count) |c| try writer.print("{d}", .{c});
                         try writer.writeByte(':');
                         try writer.writeAll(s);
@@ -2013,6 +2014,27 @@ test fmtFrom {
         \\#!srfv1
         \\name::alice,age:num:30
         \\name::bob,age:num:25
+        \\
+    , result);
+}
+test "fmtFrom commas" {
+    // Example: serialize typed Zig values directly to SRF format.
+    const Data = struct {
+        name: []const u8 = "bob",
+        age: u8,
+    };
+    const values: []const Data = &.{
+        .{ .name = "alice, yo", .age = 30 },
+    };
+    var buf: [4096]u8 = undefined;
+    const result = try std.fmt.bufPrint(
+        &buf,
+        "{f}",
+        .{fmtFrom(Data, std.testing.allocator, values, .{})},
+    );
+    try std.testing.expectEqualStrings(
+        \\#!srfv1
+        \\name:9:alice, yo,age:num:30
         \\
     , result);
 }
