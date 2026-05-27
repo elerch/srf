@@ -1057,10 +1057,29 @@ pub const ParseOptions = struct {
     diagnostics: ?*Diagnostics = null,
 
     /// By default, the parser will copy data so it is safe to free the original
-    /// This will impose about 8% overhead, but be safer. If you do not require
-    /// this safety, set alloc_strings to false. Setting this to false is the
-    /// equivalent of the "Leaky" parsing functions of std.json
-    alloc_strings: bool = true,
+    /// buffer or use with streaming readers. This will impose about 8% overhead,
+    /// and ties the lifetime of any strings to the deinit() method. For
+    /// fixed buffer parsing, consider using .none, which will not allocate
+    /// strings. More complex use cases can use their own allocator for control
+    /// over string lifetime
+    parse_allocator: ParseAllocator = .parse_arena,
+};
+
+pub const ParseAllocator = union(enum) {
+    /// No allocator. Lifetime of any strings parsed is tied to the underlying
+    /// data passed to the reader. This is most appropriate when the caller
+    /// uses a fixed buffer, and is equivalent of the "Leaky" parsing
+    /// functions of std.json
+    none,
+    /// Use the arena allocator created by the parser to copy any strings.
+    /// This ties the lifetime of any data parsed to the parser deinit()
+    /// function. Imposes about 8% overhead compared to "none".
+    parse_arena,
+    /// Parser will use the caller-supplied allocator, providing the most
+    /// flexibility over lifetime. Overhead will be contingent on the allocator
+    /// used. If the allocator is an arena allocator, assume 8% overhead over
+    /// "none". It is likely a fixed buffer allocator would be somewhat less.
+    allocator: std.mem.Allocator,
 };
 
 const Directive = union(enum) {
@@ -1409,9 +1428,11 @@ pub fn iterator(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: P
 }
 
 inline fn dupe(allocator: std.mem.Allocator, options: ParseOptions, data: []const u8) ParseError![]const u8 {
-    if (options.alloc_strings)
-        return try allocator.dupe(u8, data);
-    return data;
+    switch (options.parse_allocator) {
+        .none => return data,
+        .parse_arena => return try allocator.dupe(u8, data),
+        .allocator => |a| return try a.dupe(u8, data),
+    }
 }
 /// Logs a parse error to diagnostics. Note that the allocator provided should
 /// *NOT* be an arena, as the message must outlive the parse results, which will
