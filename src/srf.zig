@@ -95,6 +95,7 @@ pub const ParseError = error{
     ReadFailed,
     StreamTooLong,
     OutOfMemory,
+    AllocationRequired,
     EndOfStream,
 };
 
@@ -140,7 +141,7 @@ pub const Value = union(enum) {
     /// as well as multi-line strings. Metadata is returned to assist in tracking
     ///
     /// This function is intended to be used by the SRF parser
-    pub fn parse(allocator: std.mem.Allocator, str: []const u8, state: *RecordIterator.State, delimiter: u8) ParseError!ValueWithMetaData {
+    pub fn parse(str: []const u8, state: *RecordIterator.State, delimiter: u8) ParseError!ValueWithMetaData {
         const type_val_sep_raw = std.mem.indexOfScalar(u8, str, ':');
         if (type_val_sep_raw == null) {
             try parseError("no type data or value after key", state);
@@ -159,7 +160,11 @@ pub const Value = union(enum) {
             state.column += total_chars;
             state.partial_line_column += total_chars;
             return .{
-                .item_value = .{ .string = try dupe(allocator, state.options, val) },
+                .item_value = .{ .string = try dupe(
+                    state.*,
+                    val,
+                    .value,
+                ) },
             };
         }
         if (std.mem.eql(u8, "binary", trimmed_meta)) {
@@ -179,11 +184,13 @@ pub const Value = union(enum) {
                     .error_parsing = true,
                 };
             };
-            const data = try allocator.alloc(u8, size);
-            errdefer allocator.free(data);
+            const alloc = findAllocator(state.*, .value) orelse
+                try fallbackAllocatorFor(state);
+            const data = try alloc.alloc(u8, size);
+            errdefer alloc.free(data);
             Decoder.decode(data, val) catch {
                 try parseError("error parsing base64 value", state);
-                allocator.free(data);
+                alloc.free(data);
                 return .{
                     .item_value = null,
                     .error_parsing = true,
@@ -271,12 +278,18 @@ pub const Value = union(enum) {
             // We fit on this line, everything is "normal"
             const val = rest_of_data[0..size];
             return .{
-                .item_value = .{ .string = val },
+                .item_value = .{ .string = try dupe(
+                    state.*,
+                    val,
+                    .value,
+                ) },
             };
         }
         // This is not enough, we need more data from the reader
-        const buf = try allocator.alloc(u8, size);
-        errdefer allocator.free(buf);
+        const alloc = findAllocator(state.*, .value) orelse
+            try fallbackAllocatorFor(state);
+        const buf = try alloc.alloc(u8, size);
+        errdefer alloc.free(buf);
         @memcpy(buf[0..rest_of_data.len], rest_of_data);
         // add back the newline we are skipping
         buf[rest_of_data.len] = '\n';
@@ -295,6 +308,13 @@ pub const Value = union(enum) {
             .item_value = .{ .string = buf },
             .reader_advanced = true,
         };
+    }
+    inline fn fallbackAllocatorFor(state: *RecordIterator.State) !std.mem.Allocator {
+        if (state.fallback_arena) |f| return f.allocator();
+        if (state.options.parse_allocator == .none) return error.AllocationRequired;
+        state.fallback_arena = try state.allocator.create(std.heap.ArenaAllocator);
+        state.fallback_arena.?.* = .init(state.allocator);
+        return state.fallback_arena.?.allocator();
     }
 };
 
@@ -699,6 +719,10 @@ pub const RecordIterator = struct {
         end_of_record_reached: bool = false,
         field_iterator: ?FieldIterator = null,
 
+        aa: std.mem.Allocator,
+        allocator: std.mem.Allocator,
+        fallback_arena: ?*std.heap.ArenaAllocator = null,
+
         /// Takes the next line, trimming leading whitespace and ignoring comments
         /// Directives (comments starting with #!) are preserved
         pub fn nextLine(state: *State) ?[]const u8 {
@@ -798,7 +822,6 @@ pub const RecordIterator = struct {
         /// subsequent calls continue to return `null`.
         pub fn next(self: FieldIterator) !?Field {
             const state = self.state;
-            const aa = self.arena.allocator();
             // Main parsing. We already have the first line of data, which could
             // be a record (compact format) or a key/value pair (long format)
 
@@ -837,7 +860,6 @@ pub const RecordIterator = struct {
             state.column += key.len + 1;
             state.partial_line_column += key.len + 1;
             const value = try Value.parse(
-                aa,
                 it.rest(),
                 state,
                 state.field_delimiter,
@@ -845,7 +867,10 @@ pub const RecordIterator = struct {
 
             var field: ?Field = null;
             if (!value.error_parsing) {
-                field = .{ .key = try dupe(aa, state.options, key), .value = value.item_value };
+                field = .{
+                    .key = try dupe(state.*, key, .key),
+                    .value = value.item_value,
+                };
             }
 
             if (value.reader_advanced and state.field_delimiter == ',') {
@@ -1065,12 +1090,60 @@ pub const ParseOptions = struct {
     parse_allocator: ParseAllocator = .parse_arena,
 };
 
+/// Allocator to use for parsing data
 pub const ParseAllocator = union(enum) {
-    /// No allocator. Lifetime of any strings parsed is tied to the underlying
+    /// Absolutely no allocation allowed. This will fail with AllocationRequired under the following circumstances:
+    ///
+    /// * binary data is encountered (needs decoding)
+    /// * multi-line string literals are encountered (allocation needed to accomodate streaming readers)
+    none,
+    /// No allocator. Lifetime of any data parsed is tied to the underlying
     /// data passed to the reader. This is most appropriate when the caller
     /// uses a fixed buffer, and is equivalent of the "Leaky" parsing
-    /// functions of std.json
+    /// functions of std.json. IMPORTANT: This will NOT avoid all allocations.
+    /// Specifically binary data is base64 encoded per the spec and we need
+    /// to allocate space for the decode. Also, multi-line data can not be
+    /// assumed to be available post-reader advance, and therefore allocation
+    /// is performed in that case.
+    ///
+    /// For ABSOLUTELY NO ALLOCATION, use none. Otherwise, the Parsed
+    /// struct has a deinit function that frees everything, and toOwnedFallback
+    /// which will deinit the arena for parsing and return the fallback arena
+    /// that can be released at a later time
+    none_with_fallback,
+    /// Use the arena allocator created by the parser to copy any strings.
+    /// This ties the lifetime of any data parsed to the parser deinit()
+    /// function. Imposes about 8% overhead compared to "none".
+    parse_arena,
+    /// Parser will use the caller-supplied allocator, providing the most
+    /// flexibility over lifetime. Overhead will be contingent on the allocator
+    /// used. If the allocator is an arena allocator, assume 8% overhead over
+    /// "none". It is likely a fixed buffer allocator would be somewhat less.
+    custom: CustomParseAllocator,
+};
+
+/// Allocator to use for a specific scope (either keys or values). Different
+/// from parseAllocator because the custom variant here has to be a std.mem.Allocator
+pub const ScopeAllocator = union(enum) {
+    /// Absolutely no allocation allowed. This will fail with AllocationRequired under the following circumstances:
+    ///
+    /// * binary data is encountered (needs decoding)
+    /// * multi-line string literals are encountered (allocation needed to accomodate streaming readers)
     none,
+    /// No allocator. Lifetime of any data parsed is tied to the underlying
+    /// data passed to the reader. This is most appropriate when the caller
+    /// uses a fixed buffer, and is equivalent of the "Leaky" parsing
+    /// functions of std.json. IMPORTANT: This will NOT avoid all allocations.
+    /// Specifically binary data is base64 encoded per the spec and we need
+    /// to allocate space for the decode. Also, multi-line data can not be
+    /// assumed to be available post-reader advance, and therefore allocation
+    /// is performed in that case.
+    ///
+    /// For ABSOLUTELY NO ALLOCATION, use none. Otherwise, the Parsed
+    /// struct has a deinit function that frees everything, and toOwnedFallback
+    /// which will deinit the arena for parsing and return the fallback arena
+    /// that can be released at a later time
+    none_with_fallback,
     /// Use the arena allocator created by the parser to copy any strings.
     /// This ties the lifetime of any data parsed to the parser deinit()
     /// function. Imposes about 8% overhead compared to "none".
@@ -1080,6 +1153,28 @@ pub const ParseAllocator = union(enum) {
     /// used. If the allocator is an arena allocator, assume 8% overhead over
     /// "none". It is likely a fixed buffer allocator would be somewhat less.
     allocator: std.mem.Allocator,
+};
+pub const CustomParseAllocator = struct {
+    key_allocator: ScopeAllocator,
+    value_allocator: ScopeAllocator,
+
+    /// Initializes a custom parse allocator suitable for use in common workflows
+    /// where you iterate each record, then iterate through fields with full control
+    pub fn initIterator(allocator: std.mem.Allocator) CustomParseAllocator {
+        return .{
+            .key_allocator = .{ .allocator = allocator },
+            .value_allocator = .{ .allocator = allocator },
+        };
+    }
+
+    /// Initializes a custom parse allocator suitable for use in common workflows
+    /// where you iterate each record and call RecordIterator.to() on the result
+    pub fn initTo(allocator: std.mem.Allocator) CustomParseAllocator {
+        return .{
+            .key_allocator = .{ .none = {} },
+            .value_allocator = .{ .allocator = allocator },
+        };
+    }
 };
 
 const Directive = union(enum) {
@@ -1289,6 +1384,7 @@ pub const RecordFormatter = struct {
 pub const Parsed = struct {
     records: []Record,
     arena: *std.heap.ArenaAllocator,
+    fallback_arena: ?*std.heap.ArenaAllocator,
 
     /// optional expiry time for the data. Useful for caching
     /// Note that on a parse, data will always be returned and it will be up
@@ -1307,10 +1403,26 @@ pub const Parsed = struct {
     /// record and field data. After calling `deinit`, any slices or string
     /// pointers obtained from `records` are invalid.
     pub fn deinit(self: Parsed) void {
+        self.toOwnedFallback().deinit();
+    }
+
+    pub fn toOwnedFallback(self: Parsed) FallbackArena {
         const ca = self.arena.child_allocator;
         self.arena.deinit();
         ca.destroy(self.arena);
+        return .{ .fallback_arena = self.fallback_arena };
     }
+
+    pub const FallbackArena = struct {
+        fallback_arena: ?*std.heap.ArenaAllocator,
+
+        pub fn deinit(self: FallbackArena) void {
+            if (self.fallback_arena) |f| {
+                f.deinit();
+                f.child_allocator.destroy(f);
+            }
+        }
+    };
 };
 
 /// Parses all records from the reader into memory, returning a `Parsed` struct
@@ -1348,6 +1460,7 @@ pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: Pars
         .expires = it.expires,
         .created = it.created,
         .modified = it.modified,
+        .fallback_arena = it.state.fallback_arena,
     };
 }
 
@@ -1380,12 +1493,13 @@ pub fn iterator(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: P
     errdefer allocator.destroy(arena);
     arena.* = .init(allocator);
     errdefer arena.deinit();
-    const aa = arena.allocator();
-    const state = try aa.create(RecordIterator.State);
+    const state = try arena.allocator().create(RecordIterator.State);
     state.* = .{
         .reader = reader,
         .current_line = null,
         .options = options,
+        .aa = arena.allocator(),
+        .allocator = allocator,
     };
     var it: RecordIterator = .{
         .arena = arena,
@@ -1426,12 +1540,30 @@ pub fn iterator(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: P
     };
     return it; // with current_line
 }
-
-inline fn dupe(allocator: std.mem.Allocator, options: ParseOptions, data: []const u8) ParseError![]const u8 {
-    switch (options.parse_allocator) {
-        .none => return data,
-        .parse_arena => return try allocator.dupe(u8, data),
-        .allocator => |a| return try a.dupe(u8, data),
+const DataScope = enum {
+    key,
+    value,
+};
+inline fn dupe(state: RecordIterator.State, data: []const u8, scope: DataScope) ParseError![]const u8 {
+    if (findAllocator(state, scope)) |a|
+        return try a.dupe(u8, data);
+    return data;
+}
+inline fn findAllocator(state: RecordIterator.State, scope: DataScope) ?std.mem.Allocator {
+    switch (state.options.parse_allocator) {
+        .none, .none_with_fallback => return null,
+        .parse_arena => return state.aa,
+        .custom => |a| {
+            const alloc = switch (scope) {
+                .key => a.key_allocator,
+                .value => a.value_allocator,
+            };
+            switch (alloc) {
+                .none, .none_with_fallback => return null,
+                .parse_arena => return state.aa,
+                .allocator => |c| return c,
+            }
+        },
     }
 }
 /// Logs a parse error to diagnostics. Note that the allocator provided should
@@ -1794,6 +1926,48 @@ test "serialize/deserialize" {
     ;
     try std.testing.expectEqualStrings(expect, compact_from);
 }
+test "serialize/deserialize allows overflow lifetime semantics" {
+    const Data = struct {
+        foo: []const u8,
+        bar: u8,
+        qux: ?TestRecType = .foo,
+        b: bool = false,
+        f: f32 = 4.2,
+        custom: ?TestCustomType = null,
+    };
+
+    const compact =
+        \\#!srfv1
+        \\foo:binary:YmFy,bar:num:42
+        \\foo:binary:YmFy,bar:num:42
+        \\foo:binary:YmFy,bar:num:42,qux::bar
+        \\foo:binary:YmFy,bar:num:42,qux::bar,b:bool:true,f:num:6.9,custom:string:hi
+        \\
+    ;
+    // Round trip and make sure we get equivalent objects back
+    var compact_reader = std.Io.Reader.fixed(compact);
+    const parsed = try parse(
+        &compact_reader,
+        std.testing.allocator,
+        .{ .parse_allocator = .none_with_fallback },
+    );
+    try std.testing.expect(parsed.fallback_arena != null);
+
+    const rec1 = try parsed.records[0].to(Data);
+    const fallback = parsed.toOwnedFallback();
+    defer fallback.deinit();
+    // This would not be possible otherwise
+    try std.testing.expectEqualStrings("bar", rec1.foo);
+    try std.testing.expectEqual(@as(u8, 42), rec1.bar);
+    try std.testing.expectEqual(@as(TestRecType, .foo), rec1.qux);
+
+    var another_reader = std.Io.Reader.fixed(compact);
+    try std.testing.expectError(error.AllocationRequired, parse(
+        &another_reader,
+        std.testing.allocator,
+        .{ .parse_allocator = .none },
+    ));
+}
 test "conversion from string true/false to proper type" {
     const Data = struct {
         foo: []const u8,
@@ -1998,6 +2172,80 @@ test iterator {
     const field2 = (try fi.next()).?;
     try std.testing.expectEqualStrings("desc", field2.key);
     try std.testing.expectEqualStrings("world", field2.value.?.string);
+
+    // No more fields in this record
+    try std.testing.expect(try fi.next() == null);
+    // No more records
+    try std.testing.expect(try ri.next() == null);
+}
+test "iterator with custom allocator" {
+    // Example: streaming through records and fields using the iterator API.
+    // This is the preferred parsing approach -- no intermediate slices are
+    // allocated for fields or records.
+    const data =
+        \\#!srfv1
+        \\name::alice,desc:5:world
+    ;
+    const allocator = std.testing.allocator;
+    var reader = std.Io.Reader.fixed(data);
+    var ri = try iterator(
+        &reader,
+        allocator,
+        .{
+            .parse_allocator = .{ .custom = .initIterator(std.testing.allocator) },
+        },
+    );
+    defer ri.deinit();
+
+    // Advance to the first (and only) record
+    const fi = (try ri.next()).?;
+
+    // Iterate fields within the record
+    const field1 = (try fi.next()).?;
+    defer allocator.free(field1.key);
+    defer allocator.free(field1.value.?.string);
+    try std.testing.expectEqualStrings("name", field1.key);
+    try std.testing.expectEqualStrings("alice", field1.value.?.string);
+    const field2 = (try fi.next()).?;
+    defer allocator.free(field2.key);
+    defer allocator.free(field2.value.?.string);
+    try std.testing.expectEqualStrings("desc", field2.key);
+    try std.testing.expectEqualStrings("world", field2.value.?.string);
+
+    // No more fields in this record
+    try std.testing.expect(try fi.next() == null);
+    // No more records
+    try std.testing.expect(try ri.next() == null);
+}
+test "iterator with custom allocator - to() pattern" {
+    // const ll = std.testing.log_level;
+    // std.testing.log_level = .debug;
+    // defer std.testing.log_level = ll;
+    // Example: streaming through records and fields using the iterator API.
+    // This is the preferred parsing approach -- no intermediate slices are
+    // allocated for fields or records.
+    const data =
+        \\#!srfv1
+        \\name::alice,desc:5:world
+    ;
+    const allocator = std.testing.allocator;
+    var reader = std.Io.Reader.fixed(data);
+    var ri = try iterator(
+        &reader,
+        allocator,
+        .{
+            .parse_allocator = .{ .custom = .initTo(std.testing.allocator) },
+        },
+    );
+    defer ri.deinit();
+
+    // Advance to the first (and only) record
+    const fi = (try ri.next()).?;
+    const rec = try fi.to(struct { name: []const u8, desc: []const u8 });
+    defer allocator.free(rec.name);
+    defer allocator.free(rec.desc);
+    try std.testing.expectEqualStrings("alice", rec.name);
+    try std.testing.expectEqualStrings("world", rec.desc);
 
     // No more fields in this record
     try std.testing.expect(try fi.next() == null);
