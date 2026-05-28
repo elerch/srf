@@ -209,7 +209,10 @@ pub const Value = union(enum) {
             state.column += total_chars;
             state.partial_line_column += total_chars;
             const val_trimmed = std.mem.trim(u8, val, &std.ascii.whitespace);
-            const number = std.fmt.parseFloat(@FieldType(Value, "number"), val_trimmed) catch {
+            const number = (if (state.options.strict_number_parsing)
+                std.fmt.parseFloat(@FieldType(Value, "number"), val_trimmed)
+            else
+                parseFloat(@FieldType(Value, "number"), val_trimmed)) catch {
                 try parseError("error parsing numeric value", state);
                 return .{
                     .item_value = null,
@@ -315,6 +318,117 @@ pub const Value = union(enum) {
         state.fallback_arena = try state.allocator.create(std.heap.ArenaAllocator);
         state.fallback_arena.?.* = .init(state.allocator);
         return state.fallback_arena.?.allocator();
+    }
+
+    fn parseFloat(comptime T: type, value: []const u8) !T {
+        if (std.fmt.parseFloat(T, value)) |f| {
+            // clean parse
+            return f;
+        } else |_| {} // error
+
+        if (@typeInfo(T) != .float) {
+            @compileError("Cannot parse a float into a non-floating point type.");
+        }
+        // Need a temporary buffer. The maximum number of characters in our float
+        // can be calculated. This is apparently out of all the text from
+        // https://dl.acm.org/doi/epdf/10.1145/93542.93557
+        // and
+        // https://dl.acm.org/doi/epdf/10.1145/93548.93559
+        // and boils down to:
+        // 1 + ceil(p * log10(2))
+        //
+        // This is a little relevant here because we don't know the exact type,
+        // even though it's almost certainly f64 (look at the Value struct)
+        const buf_len: usize = 1 + @trunc(std.math.ceil(@as(f64, @typeInfo(T).float.bits) * @log10(@as(f64, 2))));
+        var buffer: [buf_len]u8 = undefined;
+        var val_inx: usize = 0;
+        var buf_inx: usize = 0;
+        var state: enum { start, middle, end } = .start;
+
+        // We need to "clean up" the input here
+        while (val_inx < value.len) {
+            const c = value[val_inx];
+            switch (state) {
+                .start => {
+                    if (isNumberIsh(c, false)) {
+                        state = .middle;
+                        // we don't increment val_inx here because we need to add to the buffer...
+                        continue;
+                    }
+                    // We need to have at least one more character in the string
+                    if (val_inx + 1 >= value.len) return error.InvalidCharacter;
+
+                    if (leadingCurrency(value[val_inx..])) |curr| {
+                        val_inx += curr.len;
+                        while (val_inx < value.len and value[val_inx] == ' ') val_inx += 1;
+                        state = .middle;
+                        continue;
+                    }
+                    return error.InvalidCharacter;
+                },
+                .middle => {
+                    if (!isNumberIsh(c, true)) {
+                        val_inx += 1;
+                        state = .end;
+                        continue;
+                    }
+                    // add to our buffer if it's not a comma. We aren't dealing
+                    // with comma/period locale semantics
+                    if (c == ',') {
+                        val_inx += 1;
+                        continue;
+                    }
+                    buffer[buf_inx] = c;
+                    buf_inx += 1;
+                    val_inx += 1;
+                },
+                .end => {
+                    if (value[val_inx] == ' ' and val_inx < value.len + 1) {
+                        // we don't allow trailing spaces
+                        val_inx += 1;
+                        continue;
+                    }
+                    if (leadingCurrency(value[val_inx..])) |curr| {
+                        // we are ok to end with a currency, but nothing else
+                        if (val_inx + curr.len == value.len) break;
+                    }
+                    return error.InvalidCharacter;
+                },
+            }
+        }
+        return std.fmt.parseFloat(T, buffer[0..buf_inx]);
+    }
+    fn isNumberIsh(ch: u8, in_middle: bool) bool {
+        if (ch >= '0' and ch <= '9')
+            return true;
+        if (ch == '-' or ch == '+')
+            return true;
+        if (in_middle and (ch == '.' or ch == ','))
+            return true; // we will allow . and , and allow ordering to the caller
+        return false;
+    }
+    fn leadingCurrency(s: []const u8) ?[]const u8 {
+        // Check known single character currency symbols
+        const single_byte_currencies = "$KLPQR";
+        for (single_byte_currencies) |curr|
+            if (s[0] == curr)
+                return s[0..1];
+        const two_byte_currencies = "£¤¥֏";
+        var i: usize = 0;
+        while (i < two_byte_currencies.len - 1) : (i += 2) {
+            if (two_byte_currencies[i] == s[0] and
+                two_byte_currencies[i + 1] == s[1])
+                return s[0..2];
+        }
+        const three_byte_currencies = "৳฿៛₡₦₧₩₪₫€₭₮₱₲₴₸₹₺₼₽₾⃀";
+        i = 0;
+        while (i < three_byte_currencies.len - 2) : (i += 3) {
+            if (three_byte_currencies[i] == s[0] and
+                three_byte_currencies[i + 1] == s[1] and
+                three_byte_currencies[i + 2] == s[2])
+                return s[0..3];
+        }
+        return null;
     }
 };
 
@@ -1088,6 +1202,14 @@ pub const ParseOptions = struct {
     /// strings. More complex use cases can use their own allocator for control
     /// over string lifetime
     parse_allocator: ParseAllocator = .parse_arena,
+
+    /// Strict number parsing. In strict number parsing, numbers will fail
+    /// to parse if `std.fmt.parseFloat` fails. Turn this off to be more lenient.
+    ///
+    /// Turning it off will have a slight performance impact, but helps support
+    /// scenarios where srf data is more user facing (think config, not cache).
+    /// For example, commas will be tolerated as will leading currency symbols
+    strict_number_parsing: bool = true,
 };
 
 /// Allocator to use for parsing data
@@ -2278,6 +2400,63 @@ test parse {
     try std.testing.expectEqual(@as(usize, 2), parsed.records.len);
     try std.testing.expectEqualStrings("alice", parsed.records[0].fields[0].value.?.string);
     try std.testing.expectEqualStrings("bob", parsed.records[1].fields[0].value.?.string);
+}
+test "parse tolerates commas and currency in numbers" {
+    // Example: batch parsing collects all records and fields into slices.
+    // Prefer `iterator` for streaming; use `parse` when random access to
+    // all records is needed.
+    const data =
+        \\#!srfv1
+        \\#!long
+        \\name::bananas
+        \\cost:num:$30.00
+        \\
+        \\name::spaceship
+        \\cost:num:$1,000,000,000.42
+        \\
+        \\name::Omikase in Tokyo
+        \\cost:num:¥15,000
+        \\
+        \\name::Airbus A380
+        \\cost:num:€410,000,000
+        \\
+        \\name::Bread in London
+        \\cost:num:5 €
+        \\
+        \\name::The other way
+        \\cost:num:€ 5
+        \\#!eof
+    ;
+    const allocator = std.testing.allocator;
+    var reader = std.Io.Reader.fixed(data);
+    // Diagnostics are optional, but if you would like them, include
+    // these three lines and set the options field:
+    var diags: BoundedDiagnostics(10) = .empty;
+    var diag: Diagnostics = diags.diagnostics();
+    const parsed = try parse(&reader, allocator, .{ .diagnostics = &diag, .strict_number_parsing = false });
+    defer parsed.deinit();
+
+    // Dollars are single byte currency
+    try std.testing.expectEqual(@as(usize, 6), parsed.records.len);
+    try std.testing.expectEqualStrings("bananas", parsed.records[0].fields[0].value.?.string);
+    try std.testing.expectEqual(@as(f64, 30), parsed.records[0].fields[1].value.?.number);
+
+    // Add commas to the mix
+    try std.testing.expectEqualStrings("spaceship", parsed.records[1].fields[0].value.?.string);
+    try std.testing.expectEqual(@as(f64, 1_000_000_000.42), parsed.records[1].fields[1].value.?.number);
+
+    // Yen symbol is two bytes long
+    try std.testing.expectEqualStrings("Omikase in Tokyo", parsed.records[2].fields[0].value.?.string);
+    try std.testing.expectEqual(@as(f64, 15_000), parsed.records[2].fields[1].value.?.number);
+
+    try std.testing.expectEqualStrings("Airbus A380", parsed.records[3].fields[0].value.?.string);
+    try std.testing.expectEqual(@as(f64, 410_000_000), parsed.records[3].fields[1].value.?.number);
+
+    try std.testing.expectEqualStrings("Bread in London", parsed.records[4].fields[0].value.?.string);
+    try std.testing.expectEqual(@as(f64, 5), parsed.records[4].fields[1].value.?.number);
+
+    try std.testing.expectEqualStrings("The other way", parsed.records[5].fields[0].value.?.string);
+    try std.testing.expectEqual(@as(f64, 5), parsed.records[5].fields[1].value.?.number);
 }
 test fmtFrom {
     // Example: serialize typed Zig values directly to SRF format.
