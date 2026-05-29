@@ -319,118 +319,118 @@ pub const Value = union(enum) {
         state.fallback_arena.?.* = .init(state.allocator);
         return state.fallback_arena.?.allocator();
     }
-
-    fn parseFloat(comptime T: type, value: []const u8) !T {
-        if (std.fmt.parseFloat(T, value)) |f| {
-            // clean parse
-            return f;
-        } else |_| {} // error
-
-        if (@typeInfo(T) != .float) {
-            @compileError("Cannot parse a float into a non-floating point type.");
-        }
-        // Need a temporary buffer. The maximum number of characters in our float
-        // can be calculated. This is apparently out of all the text from
-        // https://dl.acm.org/doi/epdf/10.1145/93542.93557
-        // and
-        // https://dl.acm.org/doi/epdf/10.1145/93548.93559
-        // and boils down to:
-        // 1 + ceil(p * log10(2))
-        //
-        // This is a little relevant here because we don't know the exact type,
-        // even though it's almost certainly f64 (look at the Value struct)
-        const buf_len: usize = 1 + @trunc(std.math.ceil(@as(f64, @typeInfo(T).float.bits) * @log10(@as(f64, 2))));
-        var buffer: [buf_len]u8 = undefined;
-        var val_inx: usize = 0;
-        var buf_inx: usize = 0;
-        var state: enum { start, middle, end } = .start;
-
-        // We need to "clean up" the input here
-        while (val_inx < value.len) {
-            const c = value[val_inx];
-            switch (state) {
-                .start => {
-                    if (isNumberIsh(c, false)) {
-                        state = .middle;
-                        // we don't increment val_inx here because we need to add to the buffer...
-                        continue;
-                    }
-                    // We need to have at least one more character in the string
-                    if (val_inx + 1 >= value.len) return error.InvalidCharacter;
-
-                    if (leadingCurrency(value[val_inx..])) |curr| {
-                        val_inx += curr.len;
-                        while (val_inx < value.len and value[val_inx] == ' ') val_inx += 1;
-                        state = .middle;
-                        continue;
-                    }
-                    return error.InvalidCharacter;
-                },
-                .middle => {
-                    if (!isNumberIsh(c, true)) {
-                        val_inx += 1;
-                        state = .end;
-                        continue;
-                    }
-                    // add to our buffer if it's not a comma. We aren't dealing
-                    // with comma/period locale semantics
-                    if (c == ',') {
-                        val_inx += 1;
-                        continue;
-                    }
-                    buffer[buf_inx] = c;
-                    buf_inx += 1;
-                    val_inx += 1;
-                },
-                .end => {
-                    if (value[val_inx] == ' ' and val_inx < value.len + 1) {
-                        // we don't allow trailing spaces
-                        val_inx += 1;
-                        continue;
-                    }
-                    if (leadingCurrency(value[val_inx..])) |curr| {
-                        // we are ok to end with a currency, but nothing else
-                        if (val_inx + curr.len == value.len) break;
-                    }
-                    return error.InvalidCharacter;
-                },
-            }
-        }
-        return std.fmt.parseFloat(T, buffer[0..buf_inx]);
-    }
-    fn isNumberIsh(ch: u8, in_middle: bool) bool {
-        if (ch >= '0' and ch <= '9')
-            return true;
-        if (ch == '-' or ch == '+')
-            return true;
-        if (in_middle and (ch == '.' or ch == ','))
-            return true; // we will allow . and , and allow ordering to the caller
-        return false;
-    }
-    fn leadingCurrency(s: []const u8) ?[]const u8 {
-        // Check known single character currency symbols
-        const single_byte_currencies = "$KLPQR";
-        for (single_byte_currencies) |curr|
-            if (s[0] == curr)
-                return s[0..1];
-        const two_byte_currencies = "£¤¥֏";
-        var i: usize = 0;
-        while (i < two_byte_currencies.len - 1) : (i += 2) {
-            if (two_byte_currencies[i] == s[0] and
-                two_byte_currencies[i + 1] == s[1])
-                return s[0..2];
-        }
-        const three_byte_currencies = "৳฿៛₡₦₧₩₪₫€₭₮₱₲₴₸₹₺₼₽₾⃀";
-        i = 0;
-        while (i < three_byte_currencies.len - 2) : (i += 3) {
-            if (three_byte_currencies[i] == s[0] and
-                three_byte_currencies[i + 1] == s[1] and
-                three_byte_currencies[i + 2] == s[2])
-                return s[0..3];
-        }
-        return null;
-    }
 };
+
+fn parseFloat(comptime T: type, value: []const u8) !T {
+    if (std.fmt.parseFloat(T, value)) |f| {
+        // clean parse
+        return f;
+    } else |_| {} // error
+
+    if (@typeInfo(T) != .float) {
+        @compileError("Cannot parse a float into a non-floating point type.");
+    }
+    // Need a temporary buffer. The maximum number of characters in our float
+    // can be calculated. This is apparently out of all the text from
+    // https://dl.acm.org/doi/epdf/10.1145/93542.93557
+    // and
+    // https://dl.acm.org/doi/epdf/10.1145/93548.93559
+    // and boils down to:
+    // 1 + ceil(p * log10(2))
+    //
+    // This is a little relevant here because we don't know the exact type,
+    // even though it's almost certainly f64 (look at the Value struct)
+    const buf_len: usize = 1 + @trunc(std.math.ceil(@as(f64, @typeInfo(T).float.bits) * @log10(@as(f64, 2))));
+    var buffer: [buf_len]u8 = undefined;
+    var val_inx: usize = 0;
+    var buf_inx: usize = 0;
+    var state: enum { start, middle, end } = .start;
+
+    // We need to "clean up" the input here
+    while (val_inx < value.len) {
+        const c = value[val_inx];
+        switch (state) {
+            .start => {
+                if (isNumberIsh(c, false)) {
+                    state = .middle;
+                    // we don't increment val_inx here because we need to add to the buffer...
+                    continue;
+                }
+                // We need to have at least one more character in the string
+                if (val_inx + 1 >= value.len) return error.InvalidCharacter;
+
+                if (leadingCurrency(value[val_inx..])) |curr| {
+                    val_inx += curr.len;
+                    while (val_inx < value.len and value[val_inx] == ' ') val_inx += 1;
+                    state = .middle;
+                    continue;
+                }
+                return error.InvalidCharacter;
+            },
+            .middle => {
+                if (!isNumberIsh(c, true)) {
+                    val_inx += 1;
+                    state = .end;
+                    continue;
+                }
+                // add to our buffer if it's not a comma. We aren't dealing
+                // with comma/period locale semantics
+                if (c == ',') {
+                    val_inx += 1;
+                    continue;
+                }
+                buffer[buf_inx] = c;
+                buf_inx += 1;
+                val_inx += 1;
+            },
+            .end => {
+                if (value[val_inx] == ' ' and val_inx < value.len + 1) {
+                    // we don't allow trailing spaces
+                    val_inx += 1;
+                    continue;
+                }
+                if (leadingCurrency(value[val_inx..])) |curr| {
+                    // we are ok to end with a currency, but nothing else
+                    if (val_inx + curr.len == value.len) break;
+                }
+                return error.InvalidCharacter;
+            },
+        }
+    }
+    return std.fmt.parseFloat(T, buffer[0..buf_inx]);
+}
+fn isNumberIsh(ch: u8, in_middle: bool) bool {
+    if (ch >= '0' and ch <= '9')
+        return true;
+    if (ch == '-' or ch == '+')
+        return true;
+    if (in_middle and (ch == '.' or ch == ','))
+        return true; // we will allow . and , and allow ordering to the caller
+    return false;
+}
+fn leadingCurrency(s: []const u8) ?[]const u8 {
+    // Check known single character currency symbols
+    const single_byte_currencies = "$KLPQR";
+    for (single_byte_currencies) |curr|
+        if (s[0] == curr)
+            return s[0..1];
+    const two_byte_currencies = "£¤¥֏";
+    var i: usize = 0;
+    while (i < two_byte_currencies.len - 1) : (i += 2) {
+        if (two_byte_currencies[i] == s[0] and
+            two_byte_currencies[i + 1] == s[1])
+            return s[0..2];
+    }
+    const three_byte_currencies = "৳฿៛₡₦₧₩₪₫€₭₮₱₲₴₸₹₺₼₽₾⃀";
+    i = 0;
+    while (i < three_byte_currencies.len - 2) : (i += 3) {
+        if (three_byte_currencies[i] == s[0] and
+            three_byte_currencies[i + 1] == s[1] and
+            three_byte_currencies[i + 2] == s[2])
+            return s[0..3];
+    }
+    return null;
+}
 
 /// A single key-value pair within a record. The key is always a string.
 /// The value may be `null` (from the `null` type hint) or one of the
@@ -440,17 +440,48 @@ pub const Field = struct {
     value: ?Value,
 };
 
-fn coerce(name: []const u8, comptime T: type, val: ?Value) !T {
+/// Options for type coercion
+pub const CoercionOptions = struct {
+    /// Coerce strings to numbers. This is false for the same reason
+    /// that lienient number conversion ParseOptions is off by default.
+    /// This library is intended for performant access for cache use cases.
+    /// It happens to be a relatively simple format for humans to grok,
+    /// so if you want to use this for human-edited files, turn this on
+    strings_to_numbers: bool = false,
+};
+
+pub fn CoercionResult(T: type) type {
+    return struct {
+        value: T,
+
+        /// Set this to true if the original value has been consumed and
+        /// is no longer needed. For example the string "89" coerced to int
+        /// should be freed by the caller
+        require_free_original: bool = false,
+
+        const Self = @This();
+        /// Returns a normal struct - no free required
+        pub fn init(value: T) Self {
+            return .{ .value = value };
+        }
+        /// Returns a struct requiring the caller to free original memory
+        pub fn initFree(value: T) Self {
+            return .{ .value = value, .require_free_original = true };
+        }
+    };
+}
+
+fn coerce(name: []const u8, comptime T: type, val: ?Value, options: CoercionOptions) !CoercionResult(T) {
     const ti = @typeInfo(T);
     if (val == null and ti != .optional)
         return error.NullValueCannotBeAssignedToNonNullField;
 
     // []const u8 is classified as a pointer
     switch (ti) {
-        .optional => |o| if (val) |_|
-            return try coerce(name, o.child, val)
-        else
-            return null,
+        .optional => |o| if (val) |_| {
+            const child = try coerce(name, o.child, val, options);
+            return .{ .value = child.value, .require_free_original = child.require_free_original };
+        } else return .{ .value = null },
         .pointer => |p| {
             // We don't have an allocator, so the only thing we can do
             // here is manage []const u8 or []u8
@@ -459,26 +490,39 @@ fn coerce(name: []const u8, comptime T: type, val: ?Value) !T {
             if (val.? != .string and val.? != .bytes)
                 return error.CoercionNotPossible;
             if (val.? == .string)
-                return val.?.string;
-            return val.?.bytes;
+                return .init(val.?.string);
+            return .init(val.?.bytes);
         },
         .type, .void, .noreturn => return error.CoercionNotPossible,
         .comptime_float, .comptime_int, .undefined, .null, .error_union => return error.CoercionNotPossible,
         .error_set, .@"fn", .@"opaque", .frame => return error.CoercionNotPossible,
         .@"anyframe", .vector, .enum_literal => return error.CoercionNotPossible,
-        .int => return @as(T, @intFromFloat(val.?.number)),
-        .float => return @as(T, @floatCast(val.?.number)),
-        .bool => return switch (val.?) {
-            .boolean => |b| b,
-            .string => |s| if (std.mem.eql(u8, "true", s))
-                true
-            else if (std.mem.eql(u8, "false", s))
-                false
-            else
-                error.StringValueOfBooleanMustBetrueOrfalse,
-            else => error.BooleanNotBooleanOrString,
+        .int => {
+            if (options.strings_to_numbers and val.? == .string) {
+                // At this point, we're in lienent mode, so we'll do our lienient
+                // parse, then truncate it to the int the user wants
+                const float = try parseFloat(f64, val.?.string);
+                return .initFree(@as(T, @trunc(float)));
+            }
+            return .init(@as(T, @intFromFloat(val.?.number)));
         },
-        .@"enum" => return std.meta.stringToEnum(T, val.?.string).?,
+        .float => {
+            if (options.strings_to_numbers and val.? == .string) {
+                return .initFree(try parseFloat(T, val.?.string));
+            }
+            return .init(@as(T, @floatCast(val.?.number)));
+        },
+        .bool => return switch (val.?) {
+            .boolean => |b| .init(b),
+            .string => |s| if (std.mem.eql(u8, "true", s))
+                .initFree(true)
+            else if (std.mem.eql(u8, "false", s))
+                .initFree(false)
+            else
+                return error.StringValueOfBooleanMustBetrueOrfalse,
+            else => return error.BooleanNotBooleanOrString,
+        },
+        .@"enum" => return .initFree(std.meta.stringToEnum(T, val.?.string).?),
         .array => return error.NotImplemented,
         .@"struct", .@"union" => {
             if (std.meta.hasMethod(T, "srfParse")) {
@@ -721,7 +765,7 @@ pub const Record = struct {
     /// For streaming data without collecting fields first, prefer
     /// `RecordIterator.FieldIterator.to` which avoids the intermediate
     /// `[]Field` allocation entirely.
-    pub fn to(self: Record, comptime T: type) !T {
+    pub fn to(self: Record, comptime T: type, parsed: Parsed, options: CoercionOptions) !T {
         const ti = @typeInfo(T);
 
         switch (ti) {
@@ -732,7 +776,29 @@ pub const Record = struct {
                     // find the field in the data by field name, set the value
                     // if not found, return an error
                     if (self.firstFieldByName(type_field.name)) |srf_field| {
-                        @field(obj, type_field.name) = try coerce(type_field.name, type_field.type, srf_field.value);
+                        const result = try coerce(
+                            type_field.name,
+                            type_field.type,
+                            srf_field.value,
+                            options,
+                        );
+                        @field(obj, type_field.name) = result.value;
+                        if (result.require_free_original) {
+                            if (parsed.value_allocator) |alloc|
+                                switch (srf_field.value.?) {
+                                    .string => |s| alloc.free(s),
+                                    .bytes => |b| alloc.free(b),
+                                    else => {
+                                        //std.log.err("FATAL ? {}", .{srf_field.value.?});
+                                        @panic("FATAL: requested to free a value that cannot be freed. This is a bug");
+                                    },
+                                };
+                            // This is not actually true. Without specific
+                            // allocator, the fallback arena will be used, so we
+                            // don't really need to free anything in this
+                            // circumstance
+                            // return error.AllocatorRequired;
+                        }
                     } else {
                         // No srf_field found...revert to default value
                         if (type_field.default_value_ptr) |ptr| {
@@ -756,7 +822,7 @@ pub const Record = struct {
                     const active_tag = srf_field.value.?.string;
                     inline for (std.meta.fields(T)) |f| {
                         if (std.mem.eql(u8, active_tag, f.name)) {
-                            return @unionInit(T, f.name, try self.to(f.type));
+                            return @unionInit(T, f.name, try self.to(f.type, parsed, options));
                         }
                     }
                     return error.ActiveTagDoesNotExist;
@@ -781,7 +847,7 @@ pub const Record = struct {
         const parsed = try parse(&reader, allocator, .{});
         defer parsed.deinit();
 
-        const result = try parsed.records[0].to(Data);
+        const result = try parsed.records[0].to(Data, parsed, .{});
         try std.testing.expectEqualStrings("springfield", result.city);
         try std.testing.expectEqual(@as(u8, 30), result.pop);
     }
@@ -1049,7 +1115,7 @@ pub const RecordIterator = struct {
         /// stream (unlike `Record.to` which can do random access). The tag
         /// field name defaults to `"type"` or `T.srf_tag_field` if
         /// declared.
-        pub fn to(self: FieldIterator, comptime T: type) !T {
+        pub fn to(self: FieldIterator, comptime T: type, options: CoercionOptions) !T {
             const ti = @typeInfo(T);
 
             switch (ti) {
@@ -1078,10 +1144,23 @@ pub const RecordIterator = struct {
                             if (std.mem.eql(u8, f.key, type_field.name) and
                                 !@field(found, type_field.name))
                             {
-                                @field(obj, type_field.name) =
-                                    try coerce(type_field.name, type_field.type, f.value);
+                                const result = try coerce(type_field.name, type_field.type, f.value, options);
+                                @field(obj, type_field.name) = result.value;
                                 // Now account for this in our magic found struct...
                                 @field(found, type_field.name) = true;
+                                if (result.require_free_original) {
+                                    if (findAllocator(self.state.*, .value)) |alloc|
+                                        switch (f.value.?) {
+                                            .string => |s| alloc.free(s),
+                                            .bytes => |b| alloc.free(b),
+                                            else => unreachable,
+                                        };
+                                    // This is not actually true. Without specific
+                                    // allocator, the fallback arena will be used, so we
+                                    // don't really need to free anything in this
+                                    // circumstance
+                                    // else return error.AllocatorRequired;
+                                }
                             }
                         }
                     }
@@ -1142,7 +1221,7 @@ pub const RecordIterator = struct {
             var ri = try iterator(&reader, allocator, .{});
             defer ri.deinit();
 
-            const result = try (try ri.next()).?.to(Data);
+            const result = try (try ri.next()).?.to(Data, .{});
             try std.testing.expectEqualStrings("alice", result.name);
             try std.testing.expectEqual(@as(u8, 99), result.score);
             // `active` was not in the data, so the default value is used
@@ -1507,6 +1586,8 @@ pub const Parsed = struct {
     records: []Record,
     arena: *std.heap.ArenaAllocator,
     fallback_arena: ?*std.heap.ArenaAllocator,
+    key_allocator: ?std.mem.Allocator,
+    value_allocator: ?std.mem.Allocator,
 
     /// optional expiry time for the data. Useful for caching
     /// Note that on a parse, data will always be returned and it will be up
@@ -1562,6 +1643,9 @@ pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: Pars
     errdefer it.deinit();
     const aa = it.arena.allocator();
     var field_count: usize = 1;
+    var key_allocator: ?std.mem.Allocator = null;
+    var value_allocator: ?std.mem.Allocator = null;
+    var init = false;
     while (try it.next()) |fi| {
         var al = try std.ArrayList(Field).initCapacity(aa, field_count);
         while (try fi.next()) |f| {
@@ -1575,6 +1659,11 @@ pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: Pars
         try records.append(aa, .{
             .fields = try al.toOwnedSlice(aa),
         });
+        if (!init) {
+            init = true;
+            key_allocator = findAllocator(it.state.*, .key);
+            value_allocator = findAllocator(it.state.*, .value);
+        }
     }
     return .{
         .records = try records.toOwnedSlice(aa),
@@ -1583,6 +1672,8 @@ pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: Pars
         .created = it.created,
         .modified = it.modified,
         .fallback_arena = it.state.fallback_arena,
+        .key_allocator = key_allocator,
+        .value_allocator = value_allocator,
     };
 }
 
@@ -1713,8 +1804,8 @@ const TestRecType = enum {
 };
 const TestCustomType = struct {
     const Self = @This();
-    pub fn srfParse(val: []const u8) !Self {
-        if (std.mem.eql(u8, "hi", val)) return .{};
+    pub fn srfParse(val: []const u8) !CoercionResult(Self) {
+        if (std.mem.eql(u8, "hi", val)) return .init(.{});
         return error.ValueNotEqualHi;
     }
     pub fn srfFormat(self: Self, allocator: std.mem.Allocator, comptime field_name: []const u8) !Value {
@@ -1982,11 +2073,11 @@ test "serialize/deserialize" {
     const parsed = try parse(&compact_reader, std.testing.allocator, .{});
     defer parsed.deinit();
 
-    const rec1 = try parsed.records[0].to(Data);
+    const rec1 = try parsed.records[0].to(Data, parsed, .{});
     try std.testing.expectEqualStrings("bar", rec1.foo);
     try std.testing.expectEqual(@as(u8, 42), rec1.bar);
     try std.testing.expectEqual(@as(TestRecType, .foo), rec1.qux);
-    const rec4 = try parsed.records[3].to(Data);
+    const rec4 = try parsed.records[3].to(Data, parsed, .{});
     try std.testing.expectEqualStrings("bar", rec4.foo);
     try std.testing.expectEqual(@as(u8, 42), rec4.bar);
     try std.testing.expectEqual(@as(TestRecType, .bar), rec4.qux.?);
@@ -1997,13 +2088,13 @@ test "serialize/deserialize" {
     var it_reader = std.Io.Reader.fixed(compact);
     const ri = try iterator(&it_reader, std.testing.allocator, .{});
     defer ri.deinit();
-    const rec1_it = try (try ri.next()).?.to(Data);
+    const rec1_it = try (try ri.next()).?.to(Data, .{});
     try std.testing.expectEqualStrings("bar", rec1_it.foo);
     try std.testing.expectEqual(@as(u8, 42), rec1_it.bar);
     try std.testing.expectEqual(@as(TestRecType, .foo), rec1_it.qux);
     _ = try ri.next();
     _ = try ri.next();
-    const rec4_it = try (try ri.next()).?.to(Data);
+    const rec4_it = try (try ri.next()).?.to(Data, .{});
     try std.testing.expectEqualStrings("bar", rec4_it.foo);
     try std.testing.expectEqual(@as(u8, 42), rec4_it.bar);
     try std.testing.expectEqual(@as(TestRecType, .bar), rec4_it.qux.?);
@@ -2075,7 +2166,7 @@ test "serialize/deserialize allows overflow lifetime semantics" {
     );
     try std.testing.expect(parsed.fallback_arena != null);
 
-    const rec1 = try parsed.records[0].to(Data);
+    const rec1 = try parsed.records[0].to(Data, parsed, .{});
     const fallback = parsed.toOwnedFallback();
     defer fallback.deinit();
     // This would not be possible otherwise
@@ -2111,11 +2202,11 @@ test "conversion from string true/false to proper type" {
     const parsed = try parse(&compact_reader, std.testing.allocator, .{});
     defer parsed.deinit();
 
-    const rec1 = try parsed.records[0].to(Data);
+    const rec1 = try parsed.records[0].to(Data, parsed, .{});
     try std.testing.expect(rec1.b);
-    const rec2 = try parsed.records[1].to(Data);
+    const rec2 = try parsed.records[1].to(Data, parsed, .{});
     try std.testing.expect(!rec2.b);
-    try std.testing.expectError(error.StringValueOfBooleanMustBetrueOrfalse, parsed.records[2].to(Data));
+    try std.testing.expectError(error.StringValueOfBooleanMustBetrueOrfalse, parsed.records[2].to(Data, parsed, .{}));
 }
 test "iterator with blank" {
     const Data = struct {
@@ -2140,10 +2231,10 @@ test "iterator with blank" {
     const parsed = try parse(&compact_reader, std.testing.allocator, .{});
     defer parsed.deinit();
 
-    const rec1 = try parsed.records[0].to(Data);
+    const rec1 = try parsed.records[0].to(Data, parsed, .{});
     try std.testing.expectEqual('1', rec1.foo[0]);
     try std.testing.expectEqual(@as(u8, 42), rec1.bar);
-    const rec2 = try parsed.records[1].to(Data);
+    const rec2 = try parsed.records[1].to(Data, parsed, .{});
     try std.testing.expectEqual('2', rec2.foo[0]);
     try std.testing.expectEqual(@as(u8, 24), rec2.bar);
 }
@@ -2186,9 +2277,9 @@ test "unions" {
     const parsed = try parse(&compact_reader, std.testing.allocator, .{});
     defer parsed.deinit();
 
-    const rec1 = try parsed.records[0].to(MixedData);
+    const rec1 = try parsed.records[0].to(MixedData, parsed, .{});
     try std.testing.expectEqualDeep(data[0], rec1);
-    const rec2 = try parsed.records[1].to(MixedData);
+    const rec2 = try parsed.records[1].to(MixedData, parsed, .{});
     try std.testing.expectEqualDeep(data[1], rec2);
 }
 test "enums" {
@@ -2231,9 +2322,9 @@ test "enums" {
     const parsed = try parse(&compact_reader, std.testing.allocator, .{});
     defer parsed.deinit();
 
-    const rec1 = try parsed.records[0].to(Data);
+    const rec1 = try parsed.records[0].to(Data, parsed, .{});
     try std.testing.expectEqualDeep(data[0], rec1);
-    const rec2 = try parsed.records[1].to(Data);
+    const rec2 = try parsed.records[1].to(Data, parsed, .{});
     try std.testing.expectEqualDeep(data[1], rec2);
 
     const missing_tag =
@@ -2244,10 +2335,10 @@ test "enums" {
     var mt_reader = std.Io.Reader.fixed(missing_tag);
     const mt_parsed = try parse(&mt_reader, std.testing.allocator, .{});
     defer mt_parsed.deinit();
-    const mt_rec1 = try mt_parsed.records[0].to(Data);
+    const mt_rec1 = try mt_parsed.records[0].to(Data, parsed, .{});
     try std.testing.expect(mt_rec1.data_type == null);
 
-    const mt_rec1_dt2 = try mt_parsed.records[0].to(Data2);
+    const mt_rec1_dt2 = try mt_parsed.records[0].to(Data2, parsed, .{});
     try std.testing.expect(mt_rec1_dt2.data_type == .bar);
 }
 test "compact format length-prefixed string as last field" {
@@ -2363,7 +2454,43 @@ test "iterator with custom allocator - to() pattern" {
 
     // Advance to the first (and only) record
     const fi = (try ri.next()).?;
-    const rec = try fi.to(struct { name: []const u8, desc: []const u8 });
+    const rec = try fi.to(struct { name: []const u8, desc: []const u8 }, .{});
+    defer allocator.free(rec.name);
+    defer allocator.free(rec.desc);
+    try std.testing.expectEqualStrings("alice", rec.name);
+    try std.testing.expectEqualStrings("world", rec.desc);
+
+    // No more fields in this record
+    try std.testing.expect(try fi.next() == null);
+    // No more records
+    try std.testing.expect(try ri.next() == null);
+}
+test "iterator with custom allocator - to() pattern, relaxed and custom coercion" {
+    const ll = std.testing.log_level;
+    std.testing.log_level = .debug;
+    defer std.testing.log_level = ll;
+    // Example: streaming through records and fields using the iterator API.
+    // This is the preferred parsing approach -- no intermediate slices are
+    // allocated for fields or records.
+    // Should this also allow the lienient number parsing? probably so
+    const data =
+        \\#!srfv1
+        \\name::alice,desc:5:world,cost::$5
+    ;
+    const allocator = std.testing.allocator;
+    var reader = std.Io.Reader.fixed(data);
+    var ri = try iterator(
+        &reader,
+        allocator,
+        .{
+            .parse_allocator = .{ .custom = .initTo(std.testing.allocator) },
+        },
+    );
+    defer ri.deinit();
+
+    // Advance to the first (and only) record
+    const fi = (try ri.next()).?;
+    const rec = try fi.to(struct { name: []const u8, desc: []const u8, cost: usize }, .{ .strings_to_numbers = true });
     defer allocator.free(rec.name);
     defer allocator.free(rec.desc);
     try std.testing.expectEqualStrings("alice", rec.name);
