@@ -797,8 +797,7 @@ pub const RecordIterator = struct {
         /// defaults. Missing fields without defaults return an error.
         ///
         /// For tagged unions, the active tag field must appear first in the
-        /// stream (unlike `Record.to` which can do random access). The tag
-        /// field name defaults to `"type"` or `T.srf_tag_field` if
+        /// stream. The tag field name defaults to `"type"` or `T.srf_tag_field` if
         /// declared.
         pub fn to(self: FieldIterator, comptime T: type, options: CoercionOptions) !T {
             const ti = @typeInfo(T);
@@ -889,9 +888,7 @@ pub const RecordIterator = struct {
             return error.CoercionNotPossible;
         }
         test to {
-            // Example: coerce fields directly into a Zig struct from the iterator,
-            // without collecting into an intermediate Record. This is the most
-            // allocation-efficient path for typed deserialization.
+            // Example: coerce fields directly into a Zig struct from the iterator
             const Data = struct {
                 name: []const u8,
                 score: u8,
@@ -1119,8 +1116,7 @@ const Directive = union(enum) {
         return null;
     }
 };
-/// Options controlling SRF output formatting. Used by `fmt`, `fmtFrom`,
-/// `Record.fmt`, and related formatters.
+/// Options controlling SRF output formatting. Used by `fmt`
 pub const FormatOptions = struct {
     /// When `true`, fields are separated by newlines and records by blank
     /// lines (`#!long` format). When `false` (default), fields are
@@ -1149,13 +1145,9 @@ pub const FormatOptions = struct {
 };
 
 /// Returns a formatter for writing typed Zig values directly to SRF format.
-/// Each value is converted to a `Record` via `Record.from` and written to
-/// the output. Custom serialization is supported via the `srfFormat` method
-/// convention on struct/union fields.
-///
-/// The `allocator` is used only for fields that require custom formatting
-/// (via `srfFormat`). A `FixedBufferAllocator` is recommended for this purpose.
-pub fn fmtFrom(comptime T: type, items: []const T, options: FormatOptions) FromFormatter(T) {
+/// Custom serialization is supported via the `srfFormat` method convention
+/// on struct/union fields.
+pub fn fmt(comptime T: type, items: []const T, options: FormatOptions) FromFormatter(T) {
     return .{ .items = items, .options = options };
 }
 pub fn FromFormatter(comptime T: type) type {
@@ -1260,7 +1252,7 @@ pub fn FromFormatter(comptime T: type) type {
                 .@"struct", .@"union" => {
                     if (std.meta.hasMethod(F, "srfFormat"))
                         return val.srfFormat(field_name, writer);
-                    return error.WriteFailed;
+                    @compileError("struct/union formatting requires pub fn srfFormat(self: Self, comptime key, writer: *std.Io.Writer) std.Io.Writer.Error!void. No function found on type: " ++ F);
                 },
             }
         }
@@ -1652,7 +1644,7 @@ test "serialize/deserialize" {
     const compact_from = try std.fmt.bufPrint(
         &buf,
         "{f}",
-        .{fmtFrom(Data, all_data, .{})},
+        .{fmt(Data, all_data, .{})},
     );
 
     const expect =
@@ -1793,7 +1785,7 @@ test "unions" {
     const compact_from = try std.fmt.bufPrint(
         &buf,
         "{f}",
-        .{fmtFrom(MixedData, data, .{})},
+        .{fmt(MixedData, data, .{})},
     );
     const expect =
         \\#!srfv1
@@ -1844,7 +1836,7 @@ test "enums" {
     const compact_from = try std.fmt.bufPrint(
         &buf,
         "{f}",
-        .{fmtFrom(Data, data, .{})},
+        .{fmt(Data, data, .{})},
     );
     const expect =
         \\#!srfv1
@@ -2140,7 +2132,7 @@ test "parse tolerates commas and currency in numbers" {
 
     try std.testing.expectEqual(null, try it.next());
 }
-test fmtFrom {
+test fmt {
     // Example: serialize typed Zig values directly to SRF format.
     const Data = struct {
         name: []const u8,
@@ -2154,7 +2146,7 @@ test fmtFrom {
     const result = try std.fmt.bufPrint(
         &buf,
         "{f}",
-        .{fmtFrom(Data, values, .{})},
+        .{fmt(Data, values, .{})},
     );
     try std.testing.expectEqualStrings(
         \\#!srfv1
@@ -2163,7 +2155,7 @@ test fmtFrom {
         \\
     , result);
 }
-test "fmtFrom commas" {
+test "fmt commas" {
     // Example: serialize typed Zig values directly to SRF format.
     const Data = struct {
         name: []const u8 = "bob",
@@ -2176,7 +2168,7 @@ test "fmtFrom commas" {
     const result = try std.fmt.bufPrint(
         &buf,
         "{f}",
-        .{fmtFrom(Data, values, .{})},
+        .{fmt(Data, values, .{})},
     );
     try std.testing.expectEqualStrings(
         \\#!srfv1
@@ -2184,7 +2176,7 @@ test "fmtFrom commas" {
         \\
     , result);
 }
-test "fmtFrom outputs defaults with option" {
+test "fmt outputs defaults with option" {
     // Example: serialize typed Zig values directly to SRF format.
     const Data = struct {
         name: []const u8 = "bob",
@@ -2197,7 +2189,7 @@ test "fmtFrom outputs defaults with option" {
     const result = try std.fmt.bufPrint(
         &buf,
         "{f}",
-        .{fmtFrom(Data, values, .{ .emit_default_values = true })},
+        .{fmt(Data, values, .{ .emit_default_values = true })},
     );
     try std.testing.expectEqualStrings(
         \\#!srfv1
