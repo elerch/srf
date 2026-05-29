@@ -541,318 +541,6 @@ fn coerce(name: []const u8, comptime T: type, val: ?Value, options: CoercionOpti
     return null;
 }
 
-/// A record is an ordered list of `Field` values, with no uniqueness constraints
-/// on keys. This allows flexible use cases such as encoding arrays by repeating
-/// the same key. In long form, this could look like:
-///
-/// ```txt
-/// arr:string:foo
-/// arr:string:bar
-/// ```
-///
-/// Records are returned by the batch `parse` function. For streaming, prefer
-/// `iterator` which yields fields one at a time via `RecordIterator.FieldIterator`
-/// without collecting them into a slice.
-pub const Record = struct {
-    fields: []const Field,
-
-    /// Returns a `RecordFormatter` suitable for use with `std.fmt.bufPrint`
-    /// or any `std.Io.Writer`. Use `FormatOptions` to control compact vs
-    /// long output format.
-    pub fn fmt(value: Record, options: FormatOptions) RecordFormatter {
-        return .{ .value = value, .options = options };
-    }
-
-    /// Looks up the first `Field` whose key matches `field_name`, or returns
-    /// `null` if no such field exists. Only the first occurrence is returned;
-    /// duplicate keys are not considered.
-    pub fn firstFieldByName(self: Record, field_name: []const u8) ?Field {
-        for (self.fields) |f|
-            if (std.mem.eql(u8, f.key, field_name)) return f;
-        return null;
-    }
-
-    fn maxFields(comptime T: type) usize {
-        const ti = @typeInfo(T);
-        if (ti != .@"union") return std.meta.fields(T).len;
-        comptime var max_fields = 0;
-        inline for (std.meta.fields(T)) |f| {
-            const field_count = std.meta.fields(f.type).len;
-            if (field_count > max_fields) max_fields = field_count;
-        }
-        return max_fields + 1;
-    }
-
-    fn OwnedRecord(comptime T: type) type {
-        // for unions, we don't know how many fields we're dealing with...
-        return struct {
-            fields_buf: [fields_len]Field,
-            fields_allocated: [fields_len]bool = .{false} ** fields_len,
-            allocator: std.mem.Allocator,
-            source_value: T,
-            format_options: FormatOptions,
-            cached_record: ?Record = null,
-
-            const Self = @This();
-            const fields_len = maxFields(T);
-
-            pub const SourceType = T;
-
-            pub fn init(allocator: std.mem.Allocator, source: T, options: FormatOptions) Self {
-                return .{
-                    // SAFETY: fields_buf is set by record() and is guarded by fields_set
-                    .fields_buf = undefined,
-                    .allocator = allocator,
-                    .source_value = source,
-                    .format_options = options,
-                };
-            }
-
-            const FormatResult = struct {
-                value: ?Value,
-                allocated: bool = false,
-            };
-            fn setField(
-                self: *Self,
-                inx: usize,
-                comptime field_name: []const u8,
-                comptime field_type: type,
-                comptime default_value_ptr: ?*const anyopaque,
-                val: field_type,
-            ) !usize {
-                if (default_value_ptr) |d| {
-                    const default_val: *const field_type = @ptrCast(@alignCast(d));
-                    if (!self.format_options.emit_default_values and std.meta.eql(val, default_val.*)) return inx;
-                }
-                const value = try self.formatField(field_type, field_name, val);
-                self.fields_buf[inx] = .{
-                    .key = field_name,
-                    .value = value.value,
-                };
-                self.fields_allocated[inx] = value.allocated;
-                return inx + 1;
-            }
-            fn formatField(self: Self, comptime field_type: type, comptime field_name: []const u8, val: anytype) !FormatResult {
-                const ti = @typeInfo(field_type);
-                switch (ti) {
-                    .optional => |o| {
-                        if (val) |v|
-                            return self.formatField(o.child, field_name, v);
-                        return .{ .value = null };
-                    },
-                    .pointer => |p| {
-                        // We don't have an allocator, so the only thing we can do
-                        // here is manage []const u8 or []u8
-                        if (p.size != .slice or p.child != u8)
-                            return error.CoercionNotPossible;
-                        return .{ .value = .{ .string = val } };
-                    },
-                    .type, .void, .noreturn => return error.CoercionNotPossible,
-                    .comptime_float, .comptime_int, .undefined, .null, .error_union => return error.CoercionNotPossible,
-                    .error_set, .@"fn", .@"opaque", .frame => return error.CoercionNotPossible,
-                    .@"anyframe", .vector, .enum_literal => return error.CoercionNotPossible,
-                    .int => return .{ .value = .{ .number = @floatFromInt(val) } },
-                    .float => return .{ .value = .{ .number = @floatCast(val) } },
-                    .bool => return .{ .value = .{ .boolean = val } },
-                    .@"enum" => return .{ .value = .{ .string = @tagName(val) } },
-                    .array => return error.NotImplemented,
-                    .@"struct", .@"union" => {
-                        if (std.meta.hasMethod(field_type, "srfFormat")) {
-                            return .{
-                                .value = val.srfFormat(self.allocator, field_name) catch |e| {
-                                    log.err(
-                                        "custom format of field {s} failed : {}",
-                                        .{ field_name, e },
-                                    );
-                                    return error.CustomFormatFailed;
-                                },
-                                .allocated = true,
-                            };
-                        }
-                        return error.CoercionNotPossible;
-                    },
-                }
-            }
-            pub fn record(self: *Self) !Record {
-                return self.recordInternal(SourceType, self.source_value, 0);
-            }
-            fn recordInternal(self: *Self, comptime U: type, val: U, start_inx: usize) !Record {
-                if (self.cached_record) |r| return r;
-                var inx: usize = start_inx;
-                const ti = @typeInfo(U);
-                switch (ti) {
-                    .@"struct" => |info| {
-                        inline for (info.fields) |f| {
-                            const field_val = @field(val, f.name);
-                            inx = try self.setField(inx, f.name, f.type, f.default_value_ptr, field_val);
-                        }
-                    },
-                    .@"union" => {
-                        const active_tag_name = @tagName(val);
-                        const key = if (@hasDecl(U, "srf_tag_field"))
-                            U.srf_tag_field
-                        else
-                            "type";
-                        self.fields_buf[inx] = .{
-                            .key = key,
-                            .value = .{ .string = active_tag_name },
-                        };
-                        inx += 1;
-                        switch (val) {
-                            inline else => |payload| {
-                                if (@typeInfo(@TypeOf(payload)) == .@"union")
-                                    @compileError("Nested unions not supported for srf serialization");
-                                return self.recordInternal(@TypeOf(payload), payload, inx);
-                            },
-                        }
-                    },
-                    .@"enum" => |info| {
-                        // TODO: I do not believe this is correct
-                        inline for (info.fields) |f|
-                            inx = try self.setField(inx, f.name, self.SourceType, null, val);
-                    },
-                    .error_set => return error.ErrorSetNotSupported,
-                    else => @compileError("Expected struct, union, error set or enum type, found '" ++ @typeName(T) ++ "'"),
-                }
-                self.cached_record = .{ .fields = self.fields_buf[0..inx] };
-                return self.cached_record.?;
-            }
-            pub fn deinit(self: *Self) void {
-                for (0..fields_len) |i| {
-                    if (self.fields_allocated[i]) {
-                        if (self.fields_buf[i].value) |v| switch (v) {
-                            .string => |s| self.allocator.free(s),
-                            .bytes => |b| self.allocator.free(b),
-                            else => {},
-                        };
-                    }
-                }
-            }
-        };
-    }
-    /// Create an OwnedRecord from a Zig struct value. Fields are mapped by name:
-    /// string/optional string fields become string Values, numeric fields become
-    /// number Values, bools become boolean Values, and enums are converted via
-    /// @tagName. Struct/union fields with a `srfFormat` method use that for
-    /// custom serialization (allocated via the provided allocator).
-    ///
-    /// The returned OwnedRecord borrows string data from `val` for any
-    /// []const u8 fields. The caller must ensure `val` (and any data it
-    /// references) outlives the OwnedRecord.
-    ///
-    /// Call `deinit()` to free any allocations made for custom-formatted fields.
-    pub fn from(comptime T: type, allocator: std.mem.Allocator, val: T) !OwnedRecord(T) {
-        return OwnedRecord(T).init(allocator, val, .{});
-    }
-
-    /// Internal function to allow an OwnedRecord to see format options necessary
-    /// to emit default values
-    fn fromWithOptions(comptime T: type, allocator: std.mem.Allocator, val: T, options: FormatOptions) !OwnedRecord(T) {
-        return OwnedRecord(T).init(allocator, val, options);
-    }
-
-    /// Coerce a `Record` to a Zig struct or tagged union. For each field in `T`,
-    /// the first matching `Field` by name is coerced to the target type. Fields
-    /// with default values in `T` that are not present in the data use their
-    /// defaults. Missing fields without defaults return an error. Note that
-    /// by this logic, multiple fields with the same name will have all but the
-    /// first value silently ignored.
-    ///
-    /// For tagged unions, the active variant is determined by a field named
-    /// `"type"` (or the value of `T.srf_tag_field` if declared). The
-    /// remaining fields are coerced into the payload struct of that variant.
-    ///
-    /// For streaming data without collecting fields first, prefer
-    /// `RecordIterator.FieldIterator.to` which avoids the intermediate
-    /// `[]Field` allocation entirely.
-    pub fn to(self: Record, comptime T: type, parsed: Parsed, options: CoercionOptions) !T {
-        const ti = @typeInfo(T);
-
-        switch (ti) {
-            .@"struct" => {
-                // SAFETY: all fields updated below or error is returned
-                var obj: T = undefined;
-                inline for (std.meta.fields(T)) |type_field| {
-                    // find the field in the data by field name, set the value
-                    // if not found, return an error
-                    if (self.firstFieldByName(type_field.name)) |srf_field| {
-                        const result = try coerce(
-                            type_field.name,
-                            type_field.type,
-                            srf_field.value,
-                            options,
-                        );
-                        @field(obj, type_field.name) = result.value;
-                        if (result.require_free_original) {
-                            if (parsed.value_allocator) |alloc|
-                                switch (srf_field.value.?) {
-                                    .string => |s| alloc.free(s),
-                                    .bytes => |b| alloc.free(b),
-                                    else => {
-                                        //std.log.err("FATAL ? {}", .{srf_field.value.?});
-                                        @panic("FATAL: requested to free a value that cannot be freed. This is a bug");
-                                    },
-                                };
-                            // This is not actually true. Without specific
-                            // allocator, the fallback arena will be used, so we
-                            // don't really need to free anything in this
-                            // circumstance
-                            // return error.AllocatorRequired;
-                        }
-                    } else {
-                        // No srf_field found...revert to default value
-                        if (type_field.default_value_ptr) |ptr| {
-                            @field(obj, type_field.name) = @as(*const type_field.type, @ptrCast(@alignCast(ptr))).*;
-                        } else {
-                            log.debug("Record could not be coerced. Field {s} not found on srf data, and no default value exists on the type", .{type_field.name});
-                            return error.FieldNotFoundOnFieldWithoutDefaultValue;
-                        }
-                    }
-                }
-                return obj;
-            },
-            .@"union" => {
-                const active_tag_name = if (@hasDecl(T, "srf_tag_field"))
-                    T.srf_tag_field
-                else
-                    "type";
-                if (self.firstFieldByName(active_tag_name)) |srf_field| {
-                    if (srf_field.value == null or srf_field.value.? != .string)
-                        return error.ActiveTagValueMustBeAString;
-                    const active_tag = srf_field.value.?.string;
-                    inline for (std.meta.fields(T)) |f| {
-                        if (std.mem.eql(u8, active_tag, f.name)) {
-                            return @unionInit(T, f.name, try self.to(f.type, parsed, options));
-                        }
-                    }
-                    return error.ActiveTagDoesNotExist;
-                } else return error.ActiveTagFieldNotFound;
-            },
-            else => @compileError("Deserialization not supported on " ++ @tagName(ti) ++ " types"),
-        }
-        return error.CoercionNotPossible;
-    }
-    test to {
-        // Example: coerce a batch-parsed Record into a Zig struct.
-        const Data = struct {
-            city: []const u8,
-            pop: u8,
-        };
-        const data =
-            \\#!srfv1
-            \\city::springfield,pop:num:30
-        ;
-        const allocator = std.testing.allocator;
-        var reader = std.Io.Reader.fixed(data);
-        const parsed = try parse(&reader, allocator, .{});
-        defer parsed.deinit();
-
-        const result = try parsed.records[0].to(Data, parsed, .{});
-        try std.testing.expectEqualStrings("springfield", result.city);
-        try std.testing.expectEqual(@as(u8, 30), result.pop);
-    }
-};
-
 /// A streaming record iterator for parsing SRF data. This is the preferred
 /// parsing API because it avoids collecting all records and fields into memory
 /// at once. Created by calling `iterator`.
@@ -1101,10 +789,7 @@ pub const RecordIterator = struct {
         }
 
         /// Consumes remaining fields in this record and coerces them into a
-        /// Zig struct or tagged union `T`. This is the streaming equivalent of
-        /// `Record.to` -- it performs the same field-name matching and default
-        /// value logic, but reads directly from the parser without building an
-        /// intermediate `[]Field` slice.
+        /// Zig struct or tagged union `T`.
         ///
         /// For structs, fields are matched by name. Only the first occurrence
         /// of each field name is used; duplicates are ignored. Fields in `T`
@@ -1194,7 +879,7 @@ pub const RecordIterator = struct {
                     const active_tag = f.value.?.string;
                     inline for (std.meta.fields(T)) |field_type| {
                         if (std.mem.eql(u8, active_tag, field_type.name)) {
-                            return @unionInit(T, field_type.name, try self.to(field_type.type));
+                            return @unionInit(T, field_type.name, try self.to(field_type.type, options));
                         }
                     }
                     return error.ActiveTagDoesNotExist;
@@ -1233,10 +918,27 @@ pub const RecordIterator = struct {
     /// struct itself. After calling `deinit`, any slices or string pointers
     /// obtained from `FieldIterator.next` or `FieldIterator.to` are invalid.
     pub fn deinit(self: RecordIterator) void {
-        const child_allocator = self.arena.child_allocator;
-        self.arena.deinit();
-        child_allocator.destroy(self.arena);
+        self.toOwnedFallback().deinit();
     }
+
+    pub fn toOwnedFallback(self: RecordIterator) FallbackArena {
+        const ca = self.arena.child_allocator;
+        const fb = self.state.fallback_arena;
+        self.arena.deinit();
+        ca.destroy(self.arena);
+        return .{ .fallback_arena = fb };
+    }
+
+    pub const FallbackArena = struct {
+        fallback_arena: ?*std.heap.ArenaAllocator,
+
+        pub fn deinit(self: FallbackArena) void {
+            if (self.fallback_arena) |f| {
+                f.deinit();
+                f.child_allocator.destroy(f);
+            }
+        }
+    };
 
     /// Returns `true` if the data has not expired based on the `#!expires`
     /// directive. If no expiry was specified, the data is always considered
@@ -1446,12 +1148,6 @@ pub const FormatOptions = struct {
     emit_default_values: bool = false,
 };
 
-/// Returns a `Formatter` for writing pre-built `Record` values to a writer.
-/// Suitable for use with `std.fmt.bufPrint` or any `std.Io.Writer` via the
-/// `{f}` format specifier.
-pub fn fmt(value: []const Record, options: FormatOptions) Formatter {
-    return .{ .value = value, .options = options };
-}
 /// Returns a formatter for writing typed Zig values directly to SRF format.
 /// Each value is converted to a `Record` via `Record.from` and written to
 /// the output. Custom serialization is supported via the `srfFormat` method
@@ -1459,54 +1155,139 @@ pub fn fmt(value: []const Record, options: FormatOptions) Formatter {
 ///
 /// The `allocator` is used only for fields that require custom formatting
 /// (via `srfFormat`). A `FixedBufferAllocator` is recommended for this purpose.
-pub fn fmtFrom(comptime T: type, allocator: std.mem.Allocator, value: []const T, options: FormatOptions) FromFormatter(T) {
-    return .{ .value = value, .options = options, .allocator = allocator };
+pub fn fmtFrom(comptime T: type, items: []const T, options: FormatOptions) FromFormatter(T) {
+    return .{ .items = items, .options = options };
 }
 pub fn FromFormatter(comptime T: type) type {
     return struct {
-        value: []const T,
+        items: []const T,
         options: FormatOptions,
-        allocator: std.mem.Allocator,
 
         const Self = @This();
 
         pub fn format(self: Self, writer: *std.Io.Writer) std.Io.Writer.Error!void {
             try frontMatter(writer, self.options);
             var first = true;
-            for (self.value) |item| {
+            for (self.items) |item| {
                 if (!first and self.options.long_format) try writer.writeByte('\n');
                 first = false;
-                var owned_record = Record.fromWithOptions(
-                    T,
-                    self.allocator,
-                    item,
-                    self.options,
-                ) catch
-                    return std.Io.Writer.Error.WriteFailed;
-                defer owned_record.deinit();
-                const record = owned_record.record() catch return std.Io.Writer.Error.WriteFailed;
-                try writer.print("{f}\n", .{Record.fmt(record, self.options)});
+                try self.formatItem(T, item, writer);
             }
             try epilogue(writer, self.options);
         }
+
+        /// Formats a single item from the overall array. Analagous to a record
+        /// We take a type value here specifically for unions, because we need
+        /// to serialize the payload value of unions as well. Normally the
+        /// type value is simply "T".
+        fn formatItem(self: Self, comptime I: type, value: I, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            const ti = @typeInfo(I);
+            const delimiter: u8 = if (self.options.long_format) '\n' else ',';
+            switch (ti) {
+                .@"struct" => |info| {
+                    var first = true;
+                    inline for (info.fields) |f| {
+                        const field_val = @field(value, f.name);
+                        const is_default_val = if (f.defaultValue()) |d|
+                            std.meta.eql(field_val, d)
+                        else
+                            false;
+                        if (self.options.emit_default_values or !is_default_val) {
+                            if (!first) {
+                                try writer.writeByte(delimiter);
+                            }
+                            try self.formatField(f.type, f.name, field_val, writer);
+                            first = false;
+                        }
+                    }
+                    try writer.writeByte('\n');
+                },
+                .@"union" => {
+                    const active_tag_name = @tagName(value);
+                    const key = if (@hasDecl(T, "srf_tag_field"))
+                        T.srf_tag_field
+                    else
+                        "type";
+                    // We need to serialize the active tag name first, then the payload
+                    try self.formatField([]const u8, key, active_tag_name, writer);
+                    try writer.writeByte(delimiter);
+                    // Now to serialize the payload itself
+                    switch (value) {
+                        inline else => |payload| {
+                            if (@typeInfo(@TypeOf(payload)) == .@"union")
+                                @compileError("Nested unions not supported for srf serialization");
+                            return self.formatItem(@TypeOf(payload), payload, writer);
+                        },
+                    }
+                },
+                .@"enum" => |info| {
+                    _ = info;
+                    @compileError("Enum not implemented");
+                    // TODO: I do not believe this is correct
+                    // inline for (info.fields) |f|
+                    //     inx = try self.setField(inx, f.name, self.SourceType, null, val);
+                },
+                .error_set => return error.ErrorSetNotSupported,
+                else => @compileError("Expected struct, union, error set or enum type, found '" ++ @typeName(T) ++ "'"),
+            }
+        }
+
+        /// Formats a field from the item (struct/union). Analagous to a field in a record
+        fn formatField(self: Self, comptime F: type, comptime field_name: []const u8, val: F, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            const ti = @typeInfo(F);
+            switch (ti) {
+                .optional => |o| {
+                    if (val) |v|
+                        return self.formatField(o.child, field_name, v, writer);
+                    try self.formatValue(field_name, null, writer);
+                },
+                .pointer => |p| {
+                    // We don't have an allocator, so the only thing we can do
+                    // here is manage []const u8 or []u8
+                    if (p.size != .slice or p.child != u8)
+                        return error.WriteFailed;
+                    try self.formatValue(field_name, .{ .string = val }, writer);
+                },
+                .type, .void, .noreturn => return error.WriteFailed,
+                .comptime_float, .comptime_int, .undefined, .null, .error_union => return error.WriteFailed,
+                .error_set, .@"fn", .@"opaque", .frame => return error.WriteFailed,
+                .@"anyframe", .vector, .enum_literal => return error.WriteFailed,
+                .int => try self.formatValue(field_name, .{ .number = @floatFromInt(val) }, writer),
+                .float => try self.formatValue(field_name, .{ .number = @floatCast(val) }, writer),
+                .bool => try self.formatValue(field_name, .{ .boolean = val }, writer),
+                .@"enum" => try self.formatValue(field_name, .{ .string = @tagName(val) }, writer),
+                .array => return error.WriteFailed,
+                .@"struct", .@"union" => {
+                    if (std.meta.hasMethod(F, "srfFormat"))
+                        return val.srfFormat(field_name, writer);
+                    return error.WriteFailed;
+                },
+            }
+        }
+
+        /// Formats a single key/value pair
+        fn formatValue(self: Self, key: []const u8, value: ?Value, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            try writer.writeAll(key);
+            try writer.writeByte(':');
+            if (value) |v|
+                switch (v) {
+                    .string => |s| {
+                        const newlines = std.mem.containsAtLeastScalar(u8, s, 1, '\n');
+                        const commas = !self.options.long_format and std.mem.containsAtLeastScalar(u8, s, 1, ',');
+                        // Output the count if newlines exist
+                        const count = if (newlines or commas) s.len else null;
+                        if (count) |c| try writer.print("{d}", .{c});
+                        try writer.writeByte(':');
+                        try writer.writeAll(s);
+                    },
+                    .number => |n| try writer.print("num:{d}", .{@as(f64, @floatCast(n))}),
+                    .boolean => |b| try writer.print("bool:{}", .{b}),
+                    .bytes => |b| try writer.print("binary:{b64}", .{b}),
+                }
+            else
+                try writer.writeAll(":null:");
+        }
     };
-}
-test fmt {
-    const records: []const Record = &.{
-        .{ .fields = &.{.{ .key = "foo", .value = .{ .string = "bar" } }} },
-    };
-    var buf: [1024]u8 = undefined;
-    const formatted = try std.fmt.bufPrint(
-        &buf,
-        "{f}",
-        .{fmt(records, .{ .long_format = true })},
-    );
-    try std.testing.expectEqualStrings(
-        \\#!srfv1
-        \\#!long
-        \\foo::bar
-        \\
-    , formatted);
 }
 fn frontMatter(writer: *std.Io.Writer, options: FormatOptions) !void {
     if (!options.emit_directives) return;
@@ -1526,155 +1307,6 @@ fn epilogue(writer: *std.Io.Writer, options: FormatOptions) !void {
     if (!options.emit_directives) return;
     if (options.emit_eof)
         try writer.writeAll("#!eof\n");
-}
-
-pub const Formatter = struct {
-    value: []const Record,
-    options: FormatOptions,
-
-    pub fn format(self: Formatter, writer: *std.Io.Writer) std.Io.Writer.Error!void {
-        try frontMatter(writer, self.options);
-        var first = true;
-        for (self.value) |record| {
-            if (!first and self.options.long_format) try writer.writeByte('\n');
-            first = false;
-            try writer.print("{f}\n", .{Record.fmt(record, self.options)});
-        }
-        try epilogue(writer, self.options);
-    }
-};
-pub const RecordFormatter = struct {
-    value: Record,
-    options: FormatOptions,
-
-    pub fn format(self: RecordFormatter, writer: *std.Io.Writer) std.Io.Writer.Error!void {
-        for (self.value.fields, 0..) |f, i| {
-            try writer.writeAll(f.key);
-            if (f.value == null) {
-                try writer.writeAll(":null:");
-            } else {
-                try writer.writeByte(':');
-                switch (f.value.?) {
-                    .string => |s| {
-                        const newlines = std.mem.containsAtLeastScalar(u8, s, 1, '\n');
-                        const commas = !self.options.long_format and std.mem.containsAtLeastScalar(u8, s, 1, ',');
-                        // Output the count if newlines exist
-                        const count = if (newlines or commas) s.len else null;
-                        if (count) |c| try writer.print("{d}", .{c});
-                        try writer.writeByte(':');
-                        try writer.writeAll(s);
-                    },
-                    .number => |n| try writer.print("num:{d}", .{@as(f64, @floatCast(n))}),
-                    .boolean => |b| try writer.print("bool:{}", .{b}),
-                    .bytes => |b| try writer.print("binary:{b64}", .{b}),
-                }
-            }
-            const delimiter: u8 = if (self.options.long_format) '\n' else ',';
-            if (i < self.value.fields.len - 1)
-                try writer.writeByte(delimiter);
-        }
-    }
-};
-
-/// The result of a batch `parse` call. Contains all records collected into a
-/// single slice. All data is owned by the internal arena; call `deinit` to
-/// release everything.
-///
-/// For streaming without collecting all records, prefer `iterator` which
-/// returns a `RecordIterator` instead.
-pub const Parsed = struct {
-    records: []Record,
-    arena: *std.heap.ArenaAllocator,
-    fallback_arena: ?*std.heap.ArenaAllocator,
-    key_allocator: ?std.mem.Allocator,
-    value_allocator: ?std.mem.Allocator,
-
-    /// optional expiry time for the data. Useful for caching
-    /// Note that on a parse, data will always be returned and it will be up
-    /// to the caller to check is_fresh and determine the right thing to do
-    expires: ?i64,
-
-    /// optional created time for the data. This library does nothing with
-    /// this data, but will be tracked and available
-    created: ?i64,
-
-    /// optional modified time for the data. This library does nothing with
-    /// this data, but will be tracked and available
-    modified: ?i64,
-
-    /// Releases all memory owned by this `Parsed` result, including all
-    /// record and field data. After calling `deinit`, any slices or string
-    /// pointers obtained from `records` are invalid.
-    pub fn deinit(self: Parsed) void {
-        self.toOwnedFallback().deinit();
-    }
-
-    pub fn toOwnedFallback(self: Parsed) FallbackArena {
-        const ca = self.arena.child_allocator;
-        self.arena.deinit();
-        ca.destroy(self.arena);
-        return .{ .fallback_arena = self.fallback_arena };
-    }
-
-    pub const FallbackArena = struct {
-        fallback_arena: ?*std.heap.ArenaAllocator,
-
-        pub fn deinit(self: FallbackArena) void {
-            if (self.fallback_arena) |f| {
-                f.deinit();
-                f.child_allocator.destroy(f);
-            }
-        }
-    };
-};
-
-/// Parses all records from the reader into memory, returning a `Parsed` struct
-/// with a `records` slice. This is a convenience wrapper around `iterator` that
-/// collects all fields and records into arena-allocated slices.
-///
-/// For most use cases, prefer `iterator` instead -- it streams records lazily
-/// and avoids the cost of collecting all fields into intermediate `ArrayList`s.
-///
-/// All returned data is owned by the `Parsed` arena. Call `Parsed.deinit` to
-/// free everything at once.
-pub fn parse(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: ParseOptions) ParseError!Parsed {
-    var records = std.ArrayList(Record).empty;
-    var it = try iterator(reader, allocator, options);
-    errdefer it.deinit();
-    const aa = it.arena.allocator();
-    var field_count: usize = 1;
-    var key_allocator: ?std.mem.Allocator = null;
-    var value_allocator: ?std.mem.Allocator = null;
-    var init = false;
-    while (try it.next()) |fi| {
-        var al = try std.ArrayList(Field).initCapacity(aa, field_count);
-        while (try fi.next()) |f| {
-            try al.append(aa, .{
-                .key = f.key,
-                .value = f.value,
-            });
-        }
-        // assume that most records are same number of fields
-        field_count = @max(field_count, al.items.len);
-        try records.append(aa, .{
-            .fields = try al.toOwnedSlice(aa),
-        });
-        if (!init) {
-            init = true;
-            key_allocator = findAllocator(it.state.*, .key);
-            value_allocator = findAllocator(it.state.*, .value);
-        }
-    }
-    return .{
-        .records = try records.toOwnedSlice(aa),
-        .arena = it.arena,
-        .expires = it.expires,
-        .created = it.created,
-        .modified = it.modified,
-        .fallback_arena = it.state.fallback_arena,
-        .key_allocator = key_allocator,
-        .value_allocator = value_allocator,
-    };
 }
 
 /// Creates a streaming `RecordIterator` for the given reader. This is the
@@ -1808,12 +1440,10 @@ const TestCustomType = struct {
         if (std.mem.eql(u8, "hi", val)) return .init(.{});
         return error.ValueNotEqualHi;
     }
-    pub fn srfFormat(self: Self, allocator: std.mem.Allocator, comptime field_name: []const u8) !Value {
+    pub fn srfFormat(self: Self, comptime field_name: []const u8, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         _ = self;
-        _ = field_name;
-        return .{
-            .string = try allocator.dupe(u8, "hi"),
-        };
+        try writer.writeAll(field_name);
+        try writer.writeAll("::hi");
     }
 };
 
@@ -1829,13 +1459,21 @@ test "long format single record, no eof" {
 
     const allocator = std.testing.allocator;
     var reader = std.Io.Reader.fixed(data);
-    const records = try parse(&reader, allocator, .{});
-    defer records.deinit();
-    try std.testing.expectEqual(@as(usize, 1), records.records.len);
-    try std.testing.expectEqual(@as(usize, 1), records.records[0].fields.len);
-    const kvps = records.records[0].fields;
-    try std.testing.expectEqualStrings("key", kvps[0].key);
-    try std.testing.expectEqualStrings("string value, with any data except a \\n. an optional string length between the colons", kvps[0].value.?.string);
+    var it = try iterator(&reader, allocator, .{});
+    defer it.deinit();
+    const maybe_record = try it.next();
+    try std.testing.expect(maybe_record != null);
+    const rec = maybe_record.?;
+    const maybe_field = try rec.next();
+    try std.testing.expect(maybe_field != null);
+    const field = maybe_field.?;
+    try std.testing.expectEqualStrings("key", field.key);
+    try std.testing.expectEqualStrings(
+        "string value, with any data except a \\n. an optional string length between the colons",
+        field.value.?.string,
+    );
+    try std.testing.expect(try rec.next() == null);
+    try std.testing.expect(try it.next() == null);
 }
 test "long format from README - generic data structures, first record only" {
     const data =
@@ -1851,9 +1489,11 @@ test "long format from README - generic data structures, first record only" {
 
     const allocator = std.testing.allocator;
     var reader = std.Io.Reader.fixed(data);
-    const records = try parse(&reader, allocator, .{});
+    const records = try iterator(&reader, allocator, .{});
     defer records.deinit();
-    try std.testing.expectEqual(@as(usize, 1), records.records.len);
+    const first = (try records.next()).?;
+    try std.testing.expect((try first.next()) != null);
+    try std.testing.expect((try first.next()) == null);
 }
 
 test "long format from README - generic data structures" {
@@ -1883,36 +1523,49 @@ test "long format from README - generic data structures" {
 
     const allocator = std.testing.allocator;
     var reader = std.Io.Reader.fixed(data);
-    const records = try parse(&reader, allocator, .{});
+    const records = try iterator(&reader, allocator, .{});
     defer records.deinit();
-    try std.testing.expectEqual(@as(usize, 2), records.records.len);
-    const first = records.records[0];
-    try std.testing.expectEqual(@as(usize, 6), first.fields.len);
-    try std.testing.expectEqualStrings("key", first.fields[0].key);
-    try std.testing.expectEqualStrings("string value, with any data except a \\n. an optional string length between the colons", first.fields[0].value.?.string);
-    try std.testing.expectEqualStrings("this is a number", first.fields[1].key);
-    try std.testing.expectEqual(@as(f64, 5), first.fields[1].value.?.number);
-    try std.testing.expectEqualStrings("null value", first.fields[2].key);
-    try std.testing.expect(first.fields[2].value == null);
-    try std.testing.expectEqualStrings("array", first.fields[3].key);
-    try std.testing.expectEqualStrings("array's don't exist. Use json or toml or something", first.fields[3].value.?.string);
-    try std.testing.expectEqualStrings("data with newlines must have a length", first.fields[4].key);
-    try std.testing.expectEqualStrings("foo\nbar", first.fields[4].value.?.string);
-    try std.testing.expectEqualStrings("boolean value", first.fields[5].key);
-    try std.testing.expect(!first.fields[5].value.?.boolean);
+    var rec = (try records.next()).?;
+    var field = (try rec.next()).?;
+    try std.testing.expectEqualStrings("key", field.key);
+    try std.testing.expectEqualStrings("string value, with any data except a \\n. an optional string length between the colons", field.value.?.string);
+    field = (try rec.next()).?;
+    try std.testing.expectEqualStrings("this is a number", field.key);
+    try std.testing.expectEqual(@as(f64, 5), field.value.?.number);
+    field = (try rec.next()).?;
+    try std.testing.expectEqualStrings("null value", field.key);
+    try std.testing.expect(field.value == null);
+    field = (try rec.next()).?;
+    try std.testing.expectEqualStrings("array", field.key);
+    try std.testing.expectEqualStrings(
+        "array's don't exist. Use json or toml or something",
+        field.value.?.string,
+    );
+    field = (try rec.next()).?;
+    try std.testing.expectEqualStrings("data with newlines must have a length", field.key);
+    try std.testing.expectEqualStrings("foo\nbar", field.value.?.string);
+    field = (try rec.next()).?;
+    try std.testing.expectEqualStrings("boolean value", field.key);
+    try std.testing.expect(!field.value.?.boolean);
+    try std.testing.expect(try rec.next() == null);
 
-    const second = records.records[1];
-    try std.testing.expectEqual(@as(usize, 5), second.fields.len);
-    try std.testing.expectEqualStrings("key", second.fields[0].key);
-    try std.testing.expectEqualStrings("this is the second record", second.fields[0].value.?.string);
-    try std.testing.expectEqualStrings("this is a number", second.fields[1].key);
-    try std.testing.expectEqual(@as(f64, 42), second.fields[1].value.?.number);
-    try std.testing.expectEqualStrings("null value", second.fields[2].key);
-    try std.testing.expect(second.fields[2].value == null);
-    try std.testing.expectEqualStrings("array", second.fields[3].key);
-    try std.testing.expectEqualStrings("array's still don't exist", second.fields[3].value.?.string);
-    try std.testing.expectEqualStrings("data with newlines must have a length", second.fields[4].key);
-    try std.testing.expectEqualStrings("single line", second.fields[4].value.?.string);
+    const second = (try records.next()).?;
+    field = (try second.next()).?;
+    try std.testing.expectEqualStrings("key", field.key);
+    try std.testing.expectEqualStrings("this is the second record", field.value.?.string);
+    field = (try second.next()).?;
+    try std.testing.expectEqualStrings("this is a number", field.key);
+    try std.testing.expectEqual(@as(f64, 42), field.value.?.number);
+    field = (try second.next()).?;
+    try std.testing.expectEqualStrings("null value", field.key);
+    try std.testing.expect(field.value == null);
+    field = (try second.next()).?;
+    try std.testing.expectEqualStrings("array", field.key);
+    try std.testing.expectEqualStrings("array's still don't exist", field.value.?.string);
+    field = (try second.next()).?;
+    try std.testing.expectEqualStrings("data with newlines must have a length", field.key);
+    try std.testing.expectEqualStrings("single line", field.value.?.string);
+    try std.testing.expect(try second.next() == null);
 }
 
 test "compact format from README - generic data structures" {
@@ -1926,129 +1579,35 @@ test "compact format from README - generic data structures" {
     const allocator = std.testing.allocator;
     var reader = std.Io.Reader.fixed(data);
     // We want "parse" and "parseLeaky" probably. Second parameter is a diagnostics
-    const records = try parse(&reader, allocator, .{});
+    const records = try iterator(&reader, allocator, .{});
     defer records.deinit();
-    try std.testing.expectEqual(@as(usize, 2), records.records.len);
-    const first = records.records[0];
-    try std.testing.expectEqual(@as(usize, 6), first.fields.len);
-    try std.testing.expectEqualStrings("key", first.fields[0].key);
-    try std.testing.expectEqualStrings("string value must have a length between colons or end with a comma", first.fields[0].value.?.string);
-    try std.testing.expectEqualStrings("this is a number", first.fields[1].key);
-    try std.testing.expectEqual(@as(f64, 5), first.fields[1].value.?.number);
-    try std.testing.expectEqualStrings("null value", first.fields[2].key);
-    try std.testing.expect(first.fields[2].value == null);
-    try std.testing.expectEqualStrings("array", first.fields[3].key);
-    try std.testing.expectEqualStrings("array's don't exist. Use json or toml or something", first.fields[3].value.?.string);
-    try std.testing.expectEqualStrings("data with newlines must have a length", first.fields[4].key);
-    try std.testing.expectEqualStrings("foo\nbar", first.fields[4].value.?.string);
-    try std.testing.expectEqualStrings("boolean value", first.fields[5].key);
-    try std.testing.expect(!first.fields[5].value.?.boolean);
+    var first = (try records.next()).?;
+    var field = (try first.next()).?;
+    try std.testing.expectEqualStrings("key", field.key);
+    try std.testing.expectEqualStrings("string value must have a length between colons or end with a comma", field.value.?.string);
+    field = (try first.next()).?;
+    try std.testing.expectEqualStrings("this is a number", field.key);
+    try std.testing.expectEqual(@as(f64, 5), field.value.?.number);
+    field = (try first.next()).?;
+    try std.testing.expectEqualStrings("null value", field.key);
+    try std.testing.expect(field.value == null);
+    field = (try first.next()).?;
+    try std.testing.expectEqualStrings("array", field.key);
+    try std.testing.expectEqualStrings("array's don't exist. Use json or toml or something", field.value.?.string);
+    field = (try first.next()).?;
+    try std.testing.expectEqualStrings("data with newlines must have a length", field.key);
+    try std.testing.expectEqualStrings("foo\nbar", field.value.?.string);
+    field = (try first.next()).?;
+    try std.testing.expectEqualStrings("boolean value", field.key);
+    try std.testing.expect(!field.value.?.boolean);
+    try std.testing.expect(try first.next() == null);
 
-    const second = records.records[1];
-    try std.testing.expectEqual(@as(usize, 1), second.fields.len);
-    try std.testing.expectEqualStrings("key", second.fields[0].key);
-    try std.testing.expectEqualStrings("this is the second record", second.fields[0].value.?.string);
-}
-test "format all the things" {
-    const records: []const Record = &.{
-        .{ .fields = &.{
-            .{ .key = "foo", .value = .{ .string = "bar" } },
-            .{ .key = "foo", .value = null },
-            .{ .key = "foo", .value = .{ .bytes = "bar" } },
-            .{ .key = "foo", .value = .{ .number = 42 } },
-        } },
-        .{ .fields = &.{
-            .{ .key = "foo", .value = .{ .string = "bar" } },
-            .{ .key = "foo", .value = null },
-            .{ .key = "foo", .value = .{ .bytes = "bar" } },
-            .{ .key = "foo", .value = .{ .number = 42 } },
-        } },
-    };
-    var buf: [1024]u8 = undefined;
-    const formatted_eof = try std.fmt.bufPrint(
-        &buf,
-        "{f}",
-        .{fmt(records, .{ .long_format = true, .emit_eof = true })},
-    );
-    try std.testing.expectEqualStrings(
-        \\#!srfv1
-        \\#!long
-        \\#!requireeof
-        \\foo::bar
-        \\foo:null:
-        \\foo:binary:YmFy
-        \\foo:num:42
-        \\
-        \\foo::bar
-        \\foo:null:
-        \\foo:binary:YmFy
-        \\foo:num:42
-        \\#!eof
-        \\
-    , formatted_eof);
-
-    const formatted = try std.fmt.bufPrint(
-        &buf,
-        "{f}",
-        .{fmt(records, .{ .long_format = true })},
-    );
-    try std.testing.expectEqualStrings(
-        \\#!srfv1
-        \\#!long
-        \\foo::bar
-        \\foo:null:
-        \\foo:binary:YmFy
-        \\foo:num:42
-        \\
-        \\foo::bar
-        \\foo:null:
-        \\foo:binary:YmFy
-        \\foo:num:42
-        \\
-    , formatted);
-
-    // Round trip and make sure we get equivalent objects back
-    var formatted_reader = std.Io.Reader.fixed(formatted);
-    const parsed = try parse(&formatted_reader, std.testing.allocator, .{});
-    defer parsed.deinit();
-    try std.testing.expectEqualDeep(records, parsed.records);
-
-    const compact = try std.fmt.bufPrint(
-        &buf,
-        "{f}",
-        .{fmt(records, .{})},
-    );
-    try std.testing.expectEqualStrings(
-        \\#!srfv1
-        \\foo::bar,foo:null:,foo:binary:YmFy,foo:num:42
-        \\foo::bar,foo:null:,foo:binary:YmFy,foo:num:42
-        \\
-    , compact);
-    // Round trip and make sure we get equivalent objects back
-    var compact_reader = std.Io.Reader.fixed(compact);
-    const parsed_compact = try parse(&compact_reader, std.testing.allocator, .{});
-    defer parsed_compact.deinit();
-    try std.testing.expectEqualDeep(records, parsed_compact.records);
-
-    const expected_expires: i64 = 1772589213;
-    const compact_expires = try std.fmt.bufPrint(
-        &buf,
-        "{f}",
-        .{fmt(records, .{ .expires = expected_expires })},
-    );
-    try std.testing.expectEqualStrings(
-        \\#!srfv1
-        \\#!expires=1772589213
-        \\foo::bar,foo:null:,foo:binary:YmFy,foo:num:42
-        \\foo::bar,foo:null:,foo:binary:YmFy,foo:num:42
-        \\
-    , compact_expires);
-    // Round trip and make sure we get equivalent objects back
-    var expires_reader = std.Io.Reader.fixed(compact_expires);
-    const parsed_expires = try parse(&expires_reader, std.testing.allocator, .{});
-    defer parsed_expires.deinit();
-    try std.testing.expectEqualDeep(records, parsed_expires.records);
-    try std.testing.expectEqual(expected_expires, parsed_expires.expires.?);
+    const second = (try records.next()).?;
+    field = (try second.next()).?;
+    try std.testing.expectEqualStrings("key", field.key);
+    try std.testing.expectEqualStrings("this is the second record", field.value.?.string);
+    try std.testing.expect(try second.next() == null);
+    try std.testing.expect(try records.next() == null);
 }
 test "serialize/deserialize" {
     const Data = struct {
@@ -2068,22 +1627,6 @@ test "serialize/deserialize" {
         \\foo::bar,foo:null:,foo:binary:YmFy,foo:num:42,bar:num:42,qux::bar,b:bool:true,f:num:6.9,custom:string:hi
         \\
     ;
-    // Round trip and make sure we get equivalent objects back
-    var compact_reader = std.Io.Reader.fixed(compact);
-    const parsed = try parse(&compact_reader, std.testing.allocator, .{});
-    defer parsed.deinit();
-
-    const rec1 = try parsed.records[0].to(Data, parsed, .{});
-    try std.testing.expectEqualStrings("bar", rec1.foo);
-    try std.testing.expectEqual(@as(u8, 42), rec1.bar);
-    try std.testing.expectEqual(@as(TestRecType, .foo), rec1.qux);
-    const rec4 = try parsed.records[3].to(Data, parsed, .{});
-    try std.testing.expectEqualStrings("bar", rec4.foo);
-    try std.testing.expectEqual(@as(u8, 42), rec4.bar);
-    try std.testing.expectEqual(@as(TestRecType, .bar), rec4.qux.?);
-    try std.testing.expectEqual(true, rec4.b);
-    try std.testing.expectEqual(@as(f32, 6.9), rec4.f);
-
     // Now we'll do it with the iterator version
     var it_reader = std.Io.Reader.fixed(compact);
     const ri = try iterator(&it_reader, std.testing.allocator, .{});
@@ -2101,25 +1644,6 @@ test "serialize/deserialize" {
     try std.testing.expectEqual(true, rec4_it.b);
     try std.testing.expectEqual(@as(f32, 6.9), rec4_it.f);
 
-    const alloc = std.testing.allocator;
-    var owned_record_1 = try Record.from(Data, alloc, rec1);
-    defer owned_record_1.deinit();
-    const record_1 = try owned_record_1.record();
-    try std.testing.expectEqual(@as(usize, 2), record_1.fields.len);
-    var owned_record_4 = try Record.from(Data, alloc, rec4);
-    defer owned_record_4.deinit();
-    try std.testing.expectEqual(std.meta.fields(Data).len, owned_record_4.fields_buf.len);
-    const record_4 = try owned_record_4.record();
-    // const Data = struct {
-    //     foo: []const u8,
-    //     bar: u8,
-    //     qux: ?TestRecType = .foo,
-    //     b: bool = false,
-    //     f: f32 = 4.2,
-    //     custom: ?TestCustomType = null,
-    // };
-    try std.testing.expectEqual(@as(usize, 6), record_4.fields.len);
-
     const all_data: []const Data = &.{
         .{ .foo = "hi", .bar = 42, .qux = .bar, .b = true, .f = 6.0, .custom = .{} },
         .{ .foo = "bar", .bar = 69 },
@@ -2128,7 +1652,7 @@ test "serialize/deserialize" {
     const compact_from = try std.fmt.bufPrint(
         &buf,
         "{f}",
-        .{fmtFrom(Data, alloc, all_data, .{})},
+        .{fmtFrom(Data, all_data, .{})},
     );
 
     const expect =
@@ -2159,15 +1683,15 @@ test "serialize/deserialize allows overflow lifetime semantics" {
     ;
     // Round trip and make sure we get equivalent objects back
     var compact_reader = std.Io.Reader.fixed(compact);
-    const parsed = try parse(
+    var it = try iterator(
         &compact_reader,
         std.testing.allocator,
         .{ .parse_allocator = .none_with_fallback },
     );
-    try std.testing.expect(parsed.fallback_arena != null);
 
-    const rec1 = try parsed.records[0].to(Data, parsed, .{});
-    const fallback = parsed.toOwnedFallback();
+    const rec1 = try (try it.next()).?.to(Data, .{});
+    try std.testing.expect(it.state.fallback_arena != null);
+    const fallback = it.toOwnedFallback();
     defer fallback.deinit();
     // This would not be possible otherwise
     try std.testing.expectEqualStrings("bar", rec1.foo);
@@ -2175,11 +1699,14 @@ test "serialize/deserialize allows overflow lifetime semantics" {
     try std.testing.expectEqual(@as(TestRecType, .foo), rec1.qux);
 
     var another_reader = std.Io.Reader.fixed(compact);
-    try std.testing.expectError(error.AllocationRequired, parse(
+    var another_it = try iterator(
         &another_reader,
         std.testing.allocator,
         .{ .parse_allocator = .none },
-    ));
+    );
+    defer another_it.deinit();
+    var fi = (try another_it.next()).?;
+    try std.testing.expectError(error.AllocationRequired, fi.next());
 }
 test "conversion from string true/false to proper type" {
     const Data = struct {
@@ -2199,14 +1726,18 @@ test "conversion from string true/false to proper type" {
     ;
     // Round trip and make sure we get equivalent objects back
     var compact_reader = std.Io.Reader.fixed(compact);
-    const parsed = try parse(&compact_reader, std.testing.allocator, .{});
-    defer parsed.deinit();
+    var it = try iterator(&compact_reader, std.testing.allocator, .{});
+    defer it.deinit();
 
-    const rec1 = try parsed.records[0].to(Data, parsed, .{});
+    const rec1 = try (try it.next()).?.to(Data, .{});
     try std.testing.expect(rec1.b);
-    const rec2 = try parsed.records[1].to(Data, parsed, .{});
+    const rec2 = try (try it.next()).?.to(Data, .{});
     try std.testing.expect(!rec2.b);
-    try std.testing.expectError(error.StringValueOfBooleanMustBetrueOrfalse, parsed.records[2].to(Data, parsed, .{}));
+    const rec3_raw = (try it.next()).?;
+    try std.testing.expectError(
+        error.StringValueOfBooleanMustBetrueOrfalse,
+        rec3_raw.to(Data, .{}),
+    );
 }
 test "iterator with blank" {
     const Data = struct {
@@ -2228,13 +1759,13 @@ test "iterator with blank" {
     ;
     // Round trip and make sure we get equivalent objects back
     var compact_reader = std.Io.Reader.fixed(compact);
-    const parsed = try parse(&compact_reader, std.testing.allocator, .{});
-    defer parsed.deinit();
+    const it = try iterator(&compact_reader, std.testing.allocator, .{});
+    defer it.deinit();
 
-    const rec1 = try parsed.records[0].to(Data, parsed, .{});
+    const rec1 = try (try it.next()).?.to(Data, .{});
     try std.testing.expectEqual('1', rec1.foo[0]);
     try std.testing.expectEqual(@as(u8, 42), rec1.bar);
-    const rec2 = try parsed.records[1].to(Data, parsed, .{});
+    const rec2 = try (try it.next()).?.to(Data, .{});
     try std.testing.expectEqual('2', rec2.foo[0]);
     try std.testing.expectEqual(@as(u8, 24), rec2.bar);
 }
@@ -2258,12 +1789,11 @@ test "unions" {
         .{ .foo = .{ .number = 42, .true_or_false = true } },
         .{ .bar = .{ .sentence = "foobar", .decimal = 6.9 } },
     };
-    const alloc = std.testing.allocator;
     var buf: [4096]u8 = undefined;
     const compact_from = try std.fmt.bufPrint(
         &buf,
         "{f}",
-        .{fmtFrom(MixedData, alloc, data, .{})},
+        .{fmtFrom(MixedData, data, .{})},
     );
     const expect =
         \\#!srfv1
@@ -2274,12 +1804,12 @@ test "unions" {
     try std.testing.expectEqualStrings(expect, compact_from);
 
     var compact_reader = std.Io.Reader.fixed(expect);
-    const parsed = try parse(&compact_reader, std.testing.allocator, .{});
-    defer parsed.deinit();
+    const it = try iterator(&compact_reader, std.testing.allocator, .{});
+    defer it.deinit();
 
-    const rec1 = try parsed.records[0].to(MixedData, parsed, .{});
+    const rec1 = try (try it.next()).?.to(MixedData, .{});
     try std.testing.expectEqualDeep(data[0], rec1);
-    const rec2 = try parsed.records[1].to(MixedData, parsed, .{});
+    const rec2 = try (try it.next()).?.to(MixedData, .{});
     try std.testing.expectEqualDeep(data[1], rec2);
 }
 test "enums" {
@@ -2294,21 +1824,27 @@ test "enums" {
         data_type: ?Types = null,
         yo: u8,
     };
-    const Data2 = struct {
-        data_type: Types = .bar,
-        yo: u8,
-    };
+    // The original test here was using the non-iterator version of the parser
+    // (now deleted). That allowed random access, so we could coerce to
+    // multiple data types if they had a similar shape. I'm not sure why you
+    // might want to do that, but since we are consuming the reader in a single
+    // pass this is no longer possible. This note is here to provide some
+    // context in case this functionality is actually ever needed, we can
+    // maybe figure this out and re-enable this portion of the test
+    // const Data2 = struct {
+    //     data_type: Types = .bar,
+    //     yo: u8,
+    // };
 
     const data: []const Data = &.{
         .{ .data_type = .foo, .yo = 42 },
         .{ .data_type = null, .yo = 69 },
     };
-    const alloc = std.testing.allocator;
     var buf: [4096]u8 = undefined;
     const compact_from = try std.fmt.bufPrint(
         &buf,
         "{f}",
-        .{fmtFrom(Data, alloc, data, .{})},
+        .{fmtFrom(Data, data, .{})},
     );
     const expect =
         \\#!srfv1
@@ -2319,12 +1855,12 @@ test "enums" {
     try std.testing.expectEqualStrings(expect, compact_from);
 
     var compact_reader = std.Io.Reader.fixed(expect);
-    const parsed = try parse(&compact_reader, std.testing.allocator, .{});
-    defer parsed.deinit();
+    const it = try iterator(&compact_reader, std.testing.allocator, .{});
+    defer it.deinit();
 
-    const rec1 = try parsed.records[0].to(Data, parsed, .{});
+    const rec1 = try (try it.next()).?.to(Data, .{});
     try std.testing.expectEqualDeep(data[0], rec1);
-    const rec2 = try parsed.records[1].to(Data, parsed, .{});
+    const rec2 = try (try it.next()).?.to(Data, .{});
     try std.testing.expectEqualDeep(data[1], rec2);
 
     const missing_tag =
@@ -2333,13 +1869,14 @@ test "enums" {
         \\
     ;
     var mt_reader = std.Io.Reader.fixed(missing_tag);
-    const mt_parsed = try parse(&mt_reader, std.testing.allocator, .{});
-    defer mt_parsed.deinit();
-    const mt_rec1 = try mt_parsed.records[0].to(Data, parsed, .{});
-    try std.testing.expect(mt_rec1.data_type == null);
+    const mt = try iterator(&mt_reader, std.testing.allocator, .{});
+    defer mt.deinit();
+    const mt_rec1 = (try mt.next()).?;
+    const mt_data = try mt_rec1.to(Data, .{});
+    try std.testing.expect(mt_data.data_type == null);
 
-    const mt_rec1_dt2 = try mt_parsed.records[0].to(Data2, parsed, .{});
-    try std.testing.expect(mt_rec1_dt2.data_type == .bar);
+    // const mt_dt2 = try mt_rec1.to(Data2, .{});
+    // try std.testing.expect(mt_dt2.data_type == .bar);
 }
 test "compact format length-prefixed string as last field" {
     // When a length-prefixed value is the last field on the line,
@@ -2350,17 +1887,18 @@ test "compact format length-prefixed string as last field" {
         \\#!srfv1
         \\name::alice,desc:5:world
     ;
-    const allocator = std.testing.allocator;
     var reader = std.Io.Reader.fixed(data);
-    const records = try parse(&reader, allocator, .{});
-    defer records.deinit();
-    try std.testing.expectEqual(@as(usize, 1), records.records.len);
-    const rec = records.records[0];
-    try std.testing.expectEqual(@as(usize, 2), rec.fields.len);
-    try std.testing.expectEqualStrings("name", rec.fields[0].key);
-    try std.testing.expectEqualStrings("alice", rec.fields[0].value.?.string);
-    try std.testing.expectEqualStrings("desc", rec.fields[1].key);
-    try std.testing.expectEqualStrings("world", rec.fields[1].value.?.string);
+    const it = try iterator(&reader, std.testing.allocator, .{});
+    defer it.deinit();
+    const rec = (try it.next()).?;
+    const field1 = (try rec.next()).?;
+    try std.testing.expectEqualStrings("name", field1.key);
+    try std.testing.expectEqualStrings("alice", field1.value.?.string);
+    const field2 = (try rec.next()).?;
+    try std.testing.expectEqualStrings("desc", field2.key);
+    try std.testing.expectEqualStrings("world", field2.value.?.string);
+    try std.testing.expectEqual(null, try rec.next());
+    try std.testing.expectEqual(null, try it.next());
 }
 test iterator {
     // Example: streaming through records and fields using the iterator API.
@@ -2501,7 +2039,7 @@ test "iterator with custom allocator - to() pattern, relaxed and custom coercion
     // No more records
     try std.testing.expect(try ri.next() == null);
 }
-test parse {
+test "iterator basic long form" {
     // Example: batch parsing collects all records and fields into slices.
     // Prefer `iterator` for streaming; use `parse` when random access to
     // all records is needed.
@@ -2521,12 +2059,14 @@ test parse {
     // these three lines and set the options field:
     var diags: BoundedDiagnostics(10) = .empty;
     var diag: Diagnostics = diags.diagnostics();
-    const parsed = try parse(&reader, allocator, .{ .diagnostics = &diag });
-    defer parsed.deinit();
+    var it = try iterator(&reader, allocator, .{ .diagnostics = &diag });
+    defer it.deinit();
 
-    try std.testing.expectEqual(@as(usize, 2), parsed.records.len);
-    try std.testing.expectEqualStrings("alice", parsed.records[0].fields[0].value.?.string);
-    try std.testing.expectEqualStrings("bob", parsed.records[1].fields[0].value.?.string);
+    const first_field_first_record = (try ((try it.next()).?.next())).?;
+    try std.testing.expectEqualStrings("alice", first_field_first_record.value.?.string);
+    const first_field_second_record = (try ((try it.next()).?.next())).?;
+    try std.testing.expectEqualStrings("bob", first_field_second_record.value.?.string);
+    try std.testing.expectEqual(null, try it.next());
 }
 test "parse tolerates commas and currency in numbers" {
     // Example: batch parsing collects all records and fields into slices.
@@ -2556,34 +2096,49 @@ test "parse tolerates commas and currency in numbers" {
     ;
     const allocator = std.testing.allocator;
     var reader = std.Io.Reader.fixed(data);
-    // Diagnostics are optional, but if you would like them, include
-    // these three lines and set the options field:
-    var diags: BoundedDiagnostics(10) = .empty;
-    var diag: Diagnostics = diags.diagnostics();
-    const parsed = try parse(&reader, allocator, .{ .diagnostics = &diag, .strict_number_parsing = false });
-    defer parsed.deinit();
+    var it = try iterator(&reader, allocator, .{ .strict_number_parsing = false });
+    defer it.deinit();
 
+    var rec = (try it.next()).?;
+    var field = (try rec.next()).?;
     // Dollars are single byte currency
-    try std.testing.expectEqual(@as(usize, 6), parsed.records.len);
-    try std.testing.expectEqualStrings("bananas", parsed.records[0].fields[0].value.?.string);
-    try std.testing.expectEqual(@as(f64, 30), parsed.records[0].fields[1].value.?.number);
+    try std.testing.expectEqualStrings("bananas", field.value.?.string);
+    field = (try rec.next()).?;
+    try std.testing.expectEqual(@as(f64, 30), field.value.?.number);
 
     // Add commas to the mix
-    try std.testing.expectEqualStrings("spaceship", parsed.records[1].fields[0].value.?.string);
-    try std.testing.expectEqual(@as(f64, 1_000_000_000.42), parsed.records[1].fields[1].value.?.number);
+    rec = (try it.next()).?;
+    field = (try rec.next()).?;
+    try std.testing.expectEqualStrings("spaceship", field.value.?.string);
+    field = (try rec.next()).?;
+    try std.testing.expectEqual(@as(f64, 1_000_000_000.42), field.value.?.number);
 
     // Yen symbol is two bytes long
-    try std.testing.expectEqualStrings("Omikase in Tokyo", parsed.records[2].fields[0].value.?.string);
-    try std.testing.expectEqual(@as(f64, 15_000), parsed.records[2].fields[1].value.?.number);
+    rec = (try it.next()).?;
+    field = (try rec.next()).?;
+    try std.testing.expectEqualStrings("Omikase in Tokyo", field.value.?.string);
+    field = (try rec.next()).?;
+    try std.testing.expectEqual(@as(f64, 15_000), field.value.?.number);
 
-    try std.testing.expectEqualStrings("Airbus A380", parsed.records[3].fields[0].value.?.string);
-    try std.testing.expectEqual(@as(f64, 410_000_000), parsed.records[3].fields[1].value.?.number);
+    rec = (try it.next()).?;
+    field = (try rec.next()).?;
+    try std.testing.expectEqualStrings("Airbus A380", field.value.?.string);
+    field = (try rec.next()).?;
+    try std.testing.expectEqual(@as(f64, 410_000_000), field.value.?.number);
 
-    try std.testing.expectEqualStrings("Bread in London", parsed.records[4].fields[0].value.?.string);
-    try std.testing.expectEqual(@as(f64, 5), parsed.records[4].fields[1].value.?.number);
+    rec = (try it.next()).?;
+    field = (try rec.next()).?;
+    try std.testing.expectEqualStrings("Bread in London", field.value.?.string);
+    field = (try rec.next()).?;
+    try std.testing.expectEqual(@as(f64, 5), field.value.?.number);
 
-    try std.testing.expectEqualStrings("The other way", parsed.records[5].fields[0].value.?.string);
-    try std.testing.expectEqual(@as(f64, 5), parsed.records[5].fields[1].value.?.number);
+    rec = (try it.next()).?;
+    field = (try rec.next()).?;
+    try std.testing.expectEqualStrings("The other way", field.value.?.string);
+    field = (try rec.next()).?;
+    try std.testing.expectEqual(@as(f64, 5), field.value.?.number);
+
+    try std.testing.expectEqual(null, try it.next());
 }
 test fmtFrom {
     // Example: serialize typed Zig values directly to SRF format.
@@ -2599,7 +2154,7 @@ test fmtFrom {
     const result = try std.fmt.bufPrint(
         &buf,
         "{f}",
-        .{fmtFrom(Data, std.testing.allocator, values, .{})},
+        .{fmtFrom(Data, values, .{})},
     );
     try std.testing.expectEqualStrings(
         \\#!srfv1
@@ -2621,7 +2176,7 @@ test "fmtFrom commas" {
     const result = try std.fmt.bufPrint(
         &buf,
         "{f}",
-        .{fmtFrom(Data, std.testing.allocator, values, .{})},
+        .{fmtFrom(Data, values, .{})},
     );
     try std.testing.expectEqualStrings(
         \\#!srfv1
@@ -2642,7 +2197,7 @@ test "fmtFrom outputs defaults with option" {
     const result = try std.fmt.bufPrint(
         &buf,
         "{f}",
-        .{fmtFrom(Data, std.testing.allocator, values, .{ .emit_default_values = true })},
+        .{fmtFrom(Data, values, .{ .emit_default_values = true })},
     );
     try std.testing.expectEqualStrings(
         \\#!srfv1
@@ -2668,9 +2223,15 @@ test "parse with diagnostics" {
     var reader = std.Io.Reader.fixed(data);
     var diags: BoundedDiagnostics(10) = .empty;
     var diag: Diagnostics = diags.diagnostics();
-    try std.testing.expectError(
-        ParseError.ParseFailed,
-        parse(&reader, allocator, .{ .diagnostics = &diag }),
+    try std.testing.expect(
+        blk: {
+            var it = iterator(&reader, allocator, .{ .diagnostics = &diag }) catch break :blk false;
+            defer it.deinit();
+            while (true) {
+                _ = it.next() catch |err| break :blk err == error.ParseFailed;
+            }
+            break :blk false;
+        },
     );
     const errors = diags.errors();
     try std.testing.expectEqual(@as(usize, 1), errors.len);

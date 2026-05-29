@@ -74,8 +74,13 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, format, "srf")) {
         var reader = std.Io.Reader.fixed(data.items);
-        const records = try srf.parse(&reader, allocator, .{ .parse_allocator = .none });
-        defer records.deinit();
+        const it = try srf.iterator(&reader, allocator, .{ .parse_allocator = .none });
+        defer it.deinit();
+        // We want to touch every field, otherwise we're not really excercising
+        // this appropriately
+        while (try it.next()) |rec| {
+            while (try rec.next()) |_| {}
+        }
     } else if (std.mem.eql(u8, format, "jsonl")) {
         var lines = std.mem.splitScalar(u8, data.items, '\n');
         while (lines.next()) |line| {
