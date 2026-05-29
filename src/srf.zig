@@ -876,6 +876,9 @@ pub const RecordIterator = struct {
                     if (f.value == null or f.value.? != .string)
                         return error.ActiveTagValueMustBeAString;
                     const active_tag = f.value.?.string;
+                    // We're done with the tag. Need to free it in case a custom
+                    // allocator is in use
+                    defer if (findAllocator(self.state.*, .value)) |a| a.free(active_tag);
                     inline for (std.meta.fields(T)) |field_type| {
                         if (std.mem.eql(u8, active_tag, field_type.name)) {
                             return @unionInit(T, field_type.name, try self.to(field_type.type, options));
@@ -1803,6 +1806,46 @@ test "unions" {
     try std.testing.expectEqualDeep(data[0], rec1);
     const rec2 = try (try it.next()).?.to(MixedData, .{});
     try std.testing.expectEqualDeep(data[1], rec2);
+}
+test "union with custom-allocator initTo: dispatch tag must not leak" {
+    // Repro for: FieldIterator.to(T) on a tagged union dupes the
+    // dispatch tag's string value via the value-side allocator, then
+    // discards the slice without freeing it. With `.parse_arena`,
+    // the leak is masked by `it.deinit()`. With
+    // `.{ .custom = .initTo(my_alloc) }`, the slice lives in the
+    // caller's allocator and DebugAllocator catches the leak.
+    //
+    // Each parsed union record produces exactly one leaked
+    // allocation: the `type::<variant>` string.
+    const Foo = struct {
+        number: u8,
+    };
+    const Bar = struct {
+        decimal: f64,
+    };
+    const MixedData = union(enum) {
+        foo: Foo,
+        bar: Bar,
+    };
+    const compact =
+        \\#!srfv1
+        \\type::foo,number:num:42
+        \\type::bar,decimal:num:6.9
+        \\
+    ;
+    const allocator = std.testing.allocator;
+    var reader = std.Io.Reader.fixed(compact);
+    var ri = try iterator(&reader, allocator, .{
+        .parse_allocator = .{ .custom = .initTo(allocator) },
+    });
+    defer ri.deinit();
+    // Each `to(MixedData, .{})` call leaks one string allocation
+    // (the dispatch tag) into `allocator`. Walk both records; on
+    // exit, DebugAllocator should report 2 leaks.
+    const rec1 = try (try ri.next()).?.to(MixedData, .{});
+    try std.testing.expectEqual(@as(u8, 42), rec1.foo.number);
+    const rec2 = try (try ri.next()).?.to(MixedData, .{});
+    try std.testing.expectEqual(@as(f64, 6.9), rec2.bar.decimal);
 }
 test "enums" {
     const Types = enum {
