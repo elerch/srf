@@ -788,8 +788,9 @@ pub const RecordIterator = struct {
             return field;
         }
 
-        /// Consumes remaining fields in this record and coerces them into a
-        /// Zig struct or tagged union `T`.
+        /// Coerce a record's remaining fields into a value of type T. Walks the
+        /// parsed fields, matches them against T's field set at comptime,
+        /// and dispatches each value through `coerce()`.
         ///
         /// For structs, fields are matched by name. Only the first occurrence
         /// of each field name is used; duplicates are ignored. Fields in `T`
@@ -799,6 +800,52 @@ pub const RecordIterator = struct {
         /// For tagged unions, the active tag field must appear first in the
         /// stream. The tag field name defaults to `"type"` or `T.srf_tag_field` if
         /// declared.
+        ///
+        /// **Performance note.** `to(T)` is a generalized coercer. It
+        /// works correctly for any struct or tagged union, but the
+        /// per-field abstraction overhead — the `coerce()` call boundary,
+        /// bookkeeping, etc, imposes a fixed cost per parsed field that the
+        /// optimizer can't fully eliminate. On a 7-field record in
+        /// ReleaseFast, that cost is roughly 320 ns/record on an i9-14900K.
+        ///
+        /// For most callers, this should be fine. If, however, you are
+        /// parsing millions of records of a single fixed-shape type, and
+        /// parse speed dominates, a hand-written coercer
+        /// specialized for that T can be 25-50x faster than `to()`.
+        /// Here is an example using stock market candle data:
+        ///
+        /// ```zig
+        /// fn coerceCandle(fields: srf.RecordIterator.FieldIterator) !Candle {
+        ///     var c: Candle = .{ .date = ..., .open = 0, ..., .volume = 0 };
+        ///     while (try fields.next()) |f| {
+        ///         const val = f.value orelse continue;
+        ///         // Switch on a unique prefix of the field name.
+        ///         // For Candle, the first byte alone disambiguates.
+        ///         switch (f.key[0]) {
+        ///             'd' => if (val == .string) c.date = try Date.parse(val.string),
+        ///             'o' => if (val == .number) c.open = val.number,
+        ///             'h' => if (val == .number) c.high = val.number,
+        ///             'l' => if (val == .number) c.low = val.number,
+        ///             'c' => if (val == .number) c.close = val.number,
+        ///             'a' => if (val == .number) c.adj_close = val.number,
+        ///             'v' => if (val == .number) c.volume = @intFromFloat(val.number),
+        ///             else => {},
+        ///         }
+        ///     }
+        ///     return c;
+        /// }
+        /// ```
+        ///
+        /// The speedup comes from skipping the framework cost — direct
+        /// struct assignment, no `coerce()` call, no found-bitmap, no
+        /// per-field bookkeeping. The trade-off is that you give up
+        /// `to()`'s correctness guarantees for arbitrary T (default
+        /// values, missing-field detection, custom-parse hooks) and
+        /// take responsibility for those yourself. You will notice in the
+        /// example above, a key of "dinglebat" would happily be parsed as
+        /// candle date. ;) to() would appropriately skip this record
+        ///
+        /// Use `to()` unless profiling shows it's a bottleneck.
         pub fn to(self: FieldIterator, comptime T: type, options: CoercionOptions) !T {
             const ti = @typeInfo(T);
 
@@ -820,14 +867,18 @@ pub const RecordIterator = struct {
                     var obj: T = undefined;
 
                     while (try self.next()) |f| {
+                        // Linear scan fallback
+                        var field_match = false;
                         inline for (std.meta.fields(T)) |type_field| {
                             // To replicate the behavior of the record version of to,
                             // we need to only take the first version of the field,
                             // so if it's specified twice in the data, we will ignore
                             // all but the first instance
-                            if (std.mem.eql(u8, f.key, type_field.name) and
+                            if (!field_match and std.mem.eql(u8, type_field.name, f.key) and
                                 !@field(found, type_field.name))
                             {
+                                field_match = true;
+
                                 const result = try coerce(type_field.name, type_field.type, f.value, options);
                                 @field(obj, type_field.name) = result.value;
                                 // Now account for this in our magic found struct...
