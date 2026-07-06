@@ -541,6 +541,46 @@ fn coerce(name: []const u8, comptime T: type, val: ?Value, options: CoercionOpti
     return null;
 }
 
+pub const Tombstone = struct {
+    buf: [256]u8,
+    reason_len: ?usize,
+    until: i64,
+
+    pub fn isForever(self: *const Tombstone) bool {
+        return self.until == std.math.maxInt(i64);
+    }
+
+    pub fn reason(self: *const Tombstone) ?[]const u8 {
+        if (self.reason_len) |l|
+            return self.buf[0..l];
+        return null;
+    }
+
+    pub fn parse(val: []const u8) !Tombstone {
+        var tomb_it = std.mem.splitScalar(u8, val, ' ');
+        const until_str = tomb_it.next().?;
+        const reason_str = tomb_it.rest();
+
+        const until = if (std.mem.eql(u8, until_str, "forever"))
+            std.math.maxInt(i64)
+        else
+            std.fmt.parseInt(i64, until_str, 10) catch return ParseError.ParseFailed;
+
+        var rc: Tombstone = .{
+            // SAFETY: this is the reason buffer to avoid allocation, and is
+            // set below, gated by the reason_len
+            .buf = undefined,
+            .until = until,
+            .reason_len = null,
+        };
+        if (reason_str.len > 0) {
+            if (reason_str.len > 256) return ParseError.ParseFailed;
+            @memcpy(rc.buf[0..reason_str.len], reason_str);
+            rc.reason_len = reason_str.len;
+        }
+        return rc;
+    }
+};
 /// A streaming record iterator for parsing SRF data. This is the preferred
 /// parsing API because it avoids collecting all records and fields into memory
 /// at once. Created by calling `iterator`.
@@ -569,6 +609,13 @@ pub const RecordIterator = struct {
     /// this data, but will be tracked and available immediately after calling
     /// `iterator` if needed/provided
     modified: ?i64,
+
+    /// optional tombstone time for the data. This indicates that the data
+    /// is not valid at all. We assume that the data, when written, was
+    /// ABSENT. By providing a date here, we allow for a mechanism for a far
+    /// future retry, in effect saying "don't constantly retry, but go ahead
+    /// and retry a month from now"
+    tombstoned: ?Tombstone,
 
     state: *State,
 
@@ -996,10 +1043,24 @@ pub const RecordIterator = struct {
     /// fresh. Callers should check this after parsing to decide whether to
     /// use or refresh cached data. Note that data will be returned by parse/
     /// iterator regardless of freshness. This enables callers to use cached
-    /// data temporarily while refreshing it
-    pub fn isFresh(self: RecordIterator, io: std.Io) bool {
+    /// data temporarily while refreshing it.
+    ///
+    /// With tombstone functionality, isFresh should be consulted as well
+    /// as `dataAvailable`, which will tell the client if data is available at
+    /// all. The code looks something like this:
+    ///
+    /// if (!iterator.isFresh()) iterator = refreshData(); // refresh data
+    /// if (!iterator.dataAvailable()) fallback();
+    pub fn isFresh(self: *const RecordIterator, io: std.Io) bool {
+        const now = std.Io.Timestamp.now(io, .real).toSeconds();
+        if (self.tombstoned) |t|
+            // If we are tombstoned here, we want the client to believe data
+            // is fresh until the effective recheck time. They should then
+            // call dataAvailable() to see if data is actually available
+            return now < t.until;
+
         if (self.expires) |exp|
-            return std.Io.Timestamp.now(io, .real).toSeconds() < exp;
+            return now < exp;
 
         // no expiry: always fresh, never frozen
         return true;
@@ -1018,6 +1079,19 @@ pub const RecordIterator = struct {
 
         // No expiry set, so always fresh
         try std.testing.expect(ri.isFresh(std.testing.io));
+    }
+    /// Returns `false` if any tombstone directive is found.
+    ///
+    /// If a tombstone directive exists, there should be no usable data. Note
+    /// that srf itself does not enforce this, it is up to how you use it
+    ///
+    /// Even if the tombstone is set in the past, we assume that the data
+    /// has not been re-checked due to the presence of the directive
+    pub fn dataAvailable(self: *const RecordIterator) bool {
+        if (self.tombstoned) |_| return false;
+
+        // no tombstone - data is available
+        return true;
     }
 };
 
@@ -1137,6 +1211,7 @@ const Directive = union(enum) {
     compact_format,
     require_eof,
     eof,
+    tombstoned: Tombstone,
     expires: i64,
     created: i64,
     modified: i64,
@@ -1158,6 +1233,8 @@ const Directive = union(enum) {
         if (std.mem.eql(u8, "eof", line)) return .eof;
         if (std.mem.eql(u8, "compact", line)) return .compact_format;
         if (std.mem.eql(u8, "long", line)) return .long_format;
+        if (std.mem.startsWith(u8, line, "tombstoned="))
+            return .{ .tombstoned = try Tombstone.parse(line["tombstoned=".len..]) };
         if (std.mem.startsWith(u8, line, "expires=")) {
             return .{ .expires = std.fmt.parseInt(i64, line["expires=".len..], 10) catch return ParseError.ParseFailed };
         }
@@ -1179,6 +1256,9 @@ pub const FormatOptions = struct {
 
     /// Will emit the eof directive as well as requireeof
     emit_eof: bool = false,
+
+    /// Specify a tombstoned time for the data being written
+    tombstoned: ?Tombstone = null,
 
     /// Specify an expiration time for the data being written
     expires: ?i64 = null,
@@ -1342,6 +1422,15 @@ fn frontMatter(writer: *std.Io.Writer, options: FormatOptions) !void {
         try writer.writeAll("#!long\n");
     if (options.emit_eof)
         try writer.writeAll("#!requireeof\n");
+    if (options.tombstoned) |t| {
+        if (t.isForever())
+            try writer.writeAll("#!tombstoned=forever")
+        else
+            try writer.print("#!tombstoned={d}", .{t.until});
+        if (t.reason()) |r|
+            try writer.print(" {s}", .{r});
+        try writer.writeByte('\n');
+    }
     if (options.expires) |e|
         try writer.print("#!expires={d}\n", .{e});
     if (options.created) |e|
@@ -1394,6 +1483,7 @@ pub fn iterator(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: P
     };
     var it: RecordIterator = .{
         .arena = arena,
+        .tombstoned = null,
         .expires = null,
         .created = null,
         .modified = null,
@@ -1414,6 +1504,7 @@ pub fn iterator(reader: *std.Io.Reader, allocator: std.mem.Allocator, options: P
                     .long_format => it.state.field_delimiter = '\n',
                     .compact_format => it.state.field_delimiter = ',', // what if we have both?
                     .require_eof => it.state.require_eof = true,
+                    .tombstoned => |exp| it.tombstoned = exp,
                     .expires => |exp| it.expires = exp,
                     .created => |exp| it.created = exp,
                     .modified => |exp| it.modified = exp,
@@ -2330,4 +2421,151 @@ test "parse with diagnostics" {
     try std.testing.expectEqualStrings("error parsing numeric value", first.message);
     // const second = errors[1];
     // try std.testing.expectEqualStrings("yo", second.message);
+}
+
+// ── Tombstone ────────────────────────────────────────────────
+
+test "Tombstone.parse: forever without reason" {
+    const t = try Tombstone.parse("forever");
+    try std.testing.expect(t.isForever());
+    try std.testing.expectEqual(@as(i64, std.math.maxInt(i64)), t.until);
+    try std.testing.expect(t.reason() == null);
+}
+
+test "Tombstone.parse: forever with multi-word reason" {
+    const t = try Tombstone.parse("forever not found in tiingo");
+    try std.testing.expect(t.isForever());
+    try std.testing.expectEqualStrings("not found in tiingo", t.reason().?);
+}
+
+test "Tombstone.parse: numeric until without reason" {
+    const t = try Tombstone.parse("1782852900");
+    try std.testing.expect(!t.isForever());
+    try std.testing.expectEqual(@as(i64, 1782852900), t.until);
+    try std.testing.expect(t.reason() == null);
+}
+
+test "Tombstone.parse: numeric until with reason" {
+    const t = try Tombstone.parse("1782852900 delisted");
+    try std.testing.expect(!t.isForever());
+    try std.testing.expectEqual(@as(i64, 1782852900), t.until);
+    try std.testing.expectEqualStrings("delisted", t.reason().?);
+}
+
+test "Tombstone.parse: invalid until is a parse error" {
+    try std.testing.expectError(error.ParseFailed, Tombstone.parse("notanumber"));
+    try std.testing.expectError(error.ParseFailed, Tombstone.parse("notanumber with reason"));
+}
+
+test "Tombstone.parse: 256-byte reason accepted, 257 rejected" {
+    var buf: [8 + 257]u8 = undefined;
+    @memcpy(buf[0..8], "forever ");
+    @memset(buf[8..], 'x');
+
+    const ok = try Tombstone.parse(buf[0 .. 8 + 256]);
+    try std.testing.expectEqual(@as(usize, 256), ok.reason().?.len);
+
+    try std.testing.expectError(error.ParseFailed, Tombstone.parse(buf[0 .. 8 + 257]));
+}
+
+test "Tombstone isFresh/dataAvailable: forever" {
+    const data = "#!srfv1\n#!tombstoned=forever\n";
+    var reader = std.Io.Reader.fixed(data);
+    var ri = try iterator(&reader, std.testing.allocator, .{});
+    defer ri.deinit();
+    try std.testing.expect(ri.tombstoned != null);
+    try std.testing.expect(ri.tombstoned.?.isForever());
+    try std.testing.expect(ri.isFresh(std.testing.io)); // never re-fetch
+    try std.testing.expect(!ri.dataAvailable()); // but data is absent
+}
+
+test "Tombstone isFresh: future recheck fresh, past recheck stale" {
+    {
+        // recheck ~year 3000 -> still fresh, do not re-fetch yet
+        const data = "#!srfv1\n#!tombstoned=32503680000\n";
+        var reader = std.Io.Reader.fixed(data);
+        var ri = try iterator(&reader, std.testing.allocator, .{});
+        defer ri.deinit();
+        try std.testing.expect(ri.isFresh(std.testing.io));
+        try std.testing.expect(!ri.dataAvailable());
+    }
+    {
+        // recheck at epoch+1 -> in the past -> stale, re-fetch due
+        const data = "#!srfv1\n#!tombstoned=1\n";
+        var reader = std.Io.Reader.fixed(data);
+        var ri = try iterator(&reader, std.testing.allocator, .{});
+        defer ri.deinit();
+        try std.testing.expect(!ri.isFresh(std.testing.io));
+        try std.testing.expect(!ri.dataAvailable());
+    }
+}
+
+test "Tombstone dataAvailable: true without a tombstone" {
+    const data = "#!srfv1\nkey::value\n";
+    var reader = std.Io.Reader.fixed(data);
+    var ri = try iterator(&reader, std.testing.allocator, .{});
+    defer ri.deinit();
+    try std.testing.expect(ri.tombstoned == null);
+    try std.testing.expect(ri.dataAvailable());
+}
+
+test "Tombstone round-trip: forever with reason" {
+    const Rec = struct { k: []const u8 };
+    const items: []const Rec = &.{};
+    const tomb = try Tombstone.parse("forever not found in tiingo");
+    var buf: [512]u8 = undefined;
+    const out = try std.fmt.bufPrint(&buf, "{f}", .{fmt(Rec, items, .{ .tombstoned = tomb })});
+    try std.testing.expect(std.mem.indexOf(u8, out, "#!tombstoned=forever not found in tiingo") != null);
+
+    var reader = std.Io.Reader.fixed(out);
+    var ri = try iterator(&reader, std.testing.allocator, .{});
+    defer ri.deinit();
+    try std.testing.expect(ri.tombstoned.?.isForever());
+    try std.testing.expectEqualStrings("not found in tiingo", ri.tombstoned.?.reason().?);
+    try std.testing.expect(!ri.dataAvailable());
+}
+
+test "Tombstone round-trip: numeric until with reason" {
+    const Rec = struct { k: []const u8 };
+    const items: []const Rec = &.{};
+    const tomb = try Tombstone.parse("1782852900 delisted");
+    var buf: [512]u8 = undefined;
+    const out = try std.fmt.bufPrint(&buf, "{f}", .{fmt(Rec, items, .{ .tombstoned = tomb })});
+    try std.testing.expect(std.mem.indexOf(u8, out, "#!tombstoned=1782852900 delisted") != null);
+
+    var reader = std.Io.Reader.fixed(out);
+    var ri = try iterator(&reader, std.testing.allocator, .{});
+    defer ri.deinit();
+    try std.testing.expect(!ri.tombstoned.?.isForever());
+    try std.testing.expectEqual(@as(i64, 1782852900), ri.tombstoned.?.until);
+    try std.testing.expectEqualStrings("delisted", ri.tombstoned.?.reason().?);
+}
+
+test "Tombstone round-trip: forever without reason" {
+    const Rec = struct { k: []const u8 };
+    const items: []const Rec = &.{};
+    const tomb = try Tombstone.parse("forever");
+    var buf: [512]u8 = undefined;
+    const out = try std.fmt.bufPrint(&buf, "{f}", .{fmt(Rec, items, .{ .tombstoned = tomb })});
+    try std.testing.expect(std.mem.indexOf(u8, out, "#!tombstoned=forever\n") != null);
+
+    var reader = std.Io.Reader.fixed(out);
+    var ri = try iterator(&reader, std.testing.allocator, .{});
+    defer ri.deinit();
+    try std.testing.expect(ri.tombstoned.?.isForever());
+    try std.testing.expect(ri.tombstoned.?.reason() == null);
+}
+
+test "Tombstone reason truncates at an inline '#' (Directive comment stripping)" {
+    // Directive.parse strips inline comments (everything from a bare '#'
+    // onward) before Tombstone.parse sees the value, so a '#' embedded in a
+    // tombstone reason truncates it. This pins that known limitation:
+    // reasons should be plain text with no '#'. Note the truncation happens
+    // via the iterator/Directive path, NOT Tombstone.parse directly.
+    const data = "#!srfv1\n#!tombstoned=forever gone#not-part-of-reason\n";
+    var reader = std.Io.Reader.fixed(data);
+    var ri = try iterator(&reader, std.testing.allocator, .{});
+    defer ri.deinit();
+    try std.testing.expect(ri.tombstoned.?.isForever());
+    try std.testing.expectEqualStrings("gone", ri.tombstoned.?.reason().?);
 }
