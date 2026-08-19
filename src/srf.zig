@@ -504,12 +504,14 @@ fn coerce(name: []const u8, comptime T: type, val: ?Value, options: CoercionOpti
                 const float = try parseFloat(f64, val.?.string);
                 return .initFree(@as(T, @trunc(float)));
             }
+            if (val.? != .number) return error.IntNotNumberType;
             return .init(@as(T, @intFromFloat(val.?.number)));
         },
         .float => {
             if (options.strings_to_numbers and val.? == .string) {
                 return .initFree(try parseFloat(T, val.?.string));
             }
+            if (val.? != .number) return error.FloatNotNumberType;
             return .init(@as(T, @floatCast(val.?.number)));
         },
         .bool => return switch (val.?) {
@@ -522,7 +524,10 @@ fn coerce(name: []const u8, comptime T: type, val: ?Value, options: CoercionOpti
                 return error.StringValueOfBooleanMustBetrueOrfalse,
             else => return error.BooleanNotBooleanOrString,
         },
-        .@"enum" => return .initFree(std.meta.stringToEnum(T, val.?.string).?),
+        .@"enum" => {
+            if (val.? != .string) return error.EnumValueNotString;
+            return .initFree(std.meta.stringToEnum(T, val.?.string) orelse return error.StringValueNotValidEnumMember);
+        },
         .array => return error.NotImplemented,
         .@"struct", .@"union" => {
             if (std.meta.hasMethod(T, "srfParse")) {
@@ -2568,4 +2573,63 @@ test "Tombstone reason truncates at an inline '#' (Directive comment stripping)"
     defer ri.deinit();
     try std.testing.expect(ri.tombstoned.?.isForever());
     try std.testing.expectEqualStrings("gone", ri.tombstoned.?.reason().?);
+}
+test "coerce: unknown enum member is an error" {
+    const data =
+        \\#!srfv1
+        \\kind::gamma
+    ;
+    var reader = std.Io.Reader.fixed(data);
+    var ri = try iterator(&reader, std.testing.allocator, .{});
+    defer ri.deinit();
+    const fi = (try ri.next()).?;
+    try std.testing.expectError(
+        error.StringValueNotValidEnumMember,
+        fi.to(struct { kind: enum { alpha, beta } }, .{}),
+    );
+}
+
+test "coerce: non-string enum value is an error" {
+    const data =
+        \\#!srfv1
+        \\kind:num:1
+    ;
+    var reader = std.Io.Reader.fixed(data);
+    var ri = try iterator(&reader, std.testing.allocator, .{});
+    defer ri.deinit();
+    const fi = (try ri.next()).?;
+    try std.testing.expectError(
+        error.EnumValueNotString,
+        fi.to(struct { kind: enum { alpha, beta } }, .{}),
+    );
+}
+
+test "coerce: valid enum member still round-trips" {
+    const data =
+        \\#!srfv1
+        \\kind::beta
+    ;
+    var reader = std.Io.Reader.fixed(data);
+    var ri = try iterator(&reader, std.testing.allocator, .{});
+    defer ri.deinit();
+    const fi = (try ri.next()).?;
+    const rec = try fi.to(struct { kind: enum { alpha, beta } }, .{});
+    try std.testing.expectEqual(.beta, rec.kind);
+}
+
+test "coerce: string in a numeric field errors when strings_to_numbers is off" {
+    // The `close_price::200.00` shape that took down a downstream
+    // consumer: string separator on a numeric field.
+    const data =
+        \\#!srfv1
+        \\cost::200.00
+    ;
+    var reader = std.Io.Reader.fixed(data);
+    var ri = try iterator(&reader, std.testing.allocator, .{});
+    defer ri.deinit();
+    const fi = (try ri.next()).?;
+    try std.testing.expectError(
+        error.FloatNotNumberType,
+        fi.to(struct { cost: f64 }, .{}),
+    );
 }
