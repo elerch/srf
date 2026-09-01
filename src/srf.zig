@@ -847,6 +847,7 @@ pub const RecordIterator = struct {
                 }
             } else {
                 // We should be on a delimiter, otherwise, we should be at the end
+                if (state.current_line == null) return error.ParseFailed;
                 state.current_line = state.current_line.?[state.partial_line_column..]; // can't use l here because line may have been reassigned
                 state.partial_line_column = 0;
                 if (state.current_line.?.len == 0) {
