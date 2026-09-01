@@ -449,9 +449,14 @@ pub const Field = struct {
     ///
     /// * include_raw is set to true in ParseOptions (default is false)
     /// * the reader was not advanced during parsing
+    /// * the input was TRANSFORMED/Parsed. i.e., the value is NOT a string
     ///
     /// It's primary use is to enable surgical editing of srf data, so a caller
-    /// using this can assume a null value means "cannot edit in place"
+    /// using this can assume a null value means "cannot edit in place", or
+    /// the data is a string.
+    /// Strings are out of scope for raw, because that data is already included
+    /// in the value, and string parsing is non-trivial due to the possibility
+    /// of length-prefixed strings
     raw: ?[]const u8,
 };
 
@@ -802,7 +807,14 @@ pub const RecordIterator = struct {
             );
             // Get raw untouched bytes - useful for surgical editing. We only
             // provide this value if the scenario is simple and safe
-            const raw = if (!state.options.include_raw or value.reader_advanced) null else blk: {
+            // (binary looks like string, but is safe here because it's never
+            // length prefixed, and it goes through a transformation process,
+            // so we actually want to set raw in this case)
+            const raw = if (!state.options.include_raw or
+                value.error_parsing or
+                value.reader_advanced or
+                value.item_value == null or
+                value.item_value.? == .string) null else blk: {
                 // Basic parse to find raw value
                 const sep = std.mem.indexOfScalar(u8, rest, ':') orelse break :blk null;
                 const after = rest[sep + 1 ..];
