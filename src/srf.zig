@@ -438,6 +438,21 @@ fn leadingCurrency(s: []const u8) ?[]const u8 {
 pub const Field = struct {
     key: []const u8,
     value: ?Value,
+    /// raw value is a borrowed value (not parsed into numerics or bools, and
+    /// NOT duplicated into a caller-owned buffer). For example:
+    ///
+    /// height:num:55.2
+    ///
+    /// Has a value of .numeric = 55.2, and a raw value "55.2"
+    ///
+    /// It is only set if:
+    ///
+    /// * include_raw is set to true in ParseOptions (default is false)
+    /// * the reader was not advanced during parsing
+    ///
+    /// It's primary use is to enable surgical editing of srf data, so a caller
+    /// using this can assume a null value means "cannot edit in place"
+    raw: ?[]const u8,
 };
 
 /// Options for type coercion
@@ -779,17 +794,28 @@ pub const RecordIterator = struct {
             if (key.len > 0) std.debug.assert(key[0] != state.field_delimiter);
             state.column += key.len + 1;
             state.partial_line_column += key.len + 1;
+            const rest = it.rest();
             const value = try Value.parse(
-                it.rest(),
+                rest,
                 state,
                 state.field_delimiter,
             );
+            // Get raw untouched bytes - useful for surgical editing. We only
+            // provide this value if the scenario is simple and safe
+            const raw = if (!state.options.include_raw or value.reader_advanced) null else blk: {
+                // Basic parse to find raw value
+                const sep = std.mem.indexOfScalar(u8, rest, ':') orelse break :blk null;
+                const after = rest[sep + 1 ..];
+                const end = std.mem.indexOfScalar(u8, after, state.field_delimiter) orelse after.len;
+                break :blk after[0..end];
+            };
 
             var field: ?Field = null;
             if (!value.error_parsing) {
                 field = .{
                     .key = try dupe(state.*, key, .key),
                     .value = value.item_value,
+                    .raw = raw,
                 };
             }
 
@@ -1121,6 +1147,14 @@ pub const ParseOptions = struct {
     /// scenarios where srf data is more user facing (think config, not cache).
     /// For example, commas will be tolerated as will leading currency symbols
     strict_number_parsing: bool = true,
+
+    /// Include raw value data. If this is set to false, only parsed data
+    /// will be included for numbers/bools. False is usually what you want,
+    /// but setting this to true can be useful to make surgical edits to the
+    /// stream while preserving all comments, etc. that may exist. There is
+    /// a negligible runtime cost, as the raw slice is ALWAYS borrowed from
+    /// the underlying stream, even if allocating during the parse.
+    include_raw: bool = false,
 };
 
 /// Allocator to use for parsing data
@@ -2632,4 +2666,22 @@ test "coerce: string in a numeric field errors when strings_to_numbers is off" {
         error.FloatNotNumberType,
         fi.to(struct { cost: f64 }, .{}),
     );
+}
+
+test "raw values returned iff include_raw is set to true" {
+    const data =
+        \\#!srfv1
+        \\cost:num:200.00
+    ;
+    // raw option off
+    var reader = std.Io.Reader.fixed(data);
+    var ri = try iterator(&reader, std.testing.allocator, .{});
+    defer ri.deinit();
+    const fi = (try ri.next()).?;
+    try std.testing.expect((try fi.next()).?.raw == null);
+    var raw_reader = std.Io.Reader.fixed(data);
+    var raw_ri = try iterator(&raw_reader, std.testing.allocator, .{ .include_raw = true });
+    defer raw_ri.deinit();
+    const raw_fi = (try raw_ri.next()).?;
+    try std.testing.expectEqualStrings("200.00", (try raw_fi.next()).?.raw.?);
 }
