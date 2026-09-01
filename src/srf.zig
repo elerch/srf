@@ -84,7 +84,7 @@ pub fn BoundedDiagnostics(comptime max_errors: usize) type {
             self.buffer[self.error_count].message = try self.allocator.dupe(u8, err.message);
             self.error_count += 1;
         }
-        pub fn errors(self: Self) []const ParseLineError {
+        pub fn errors(self: *const Self) []const ParseLineError {
             return self.buffer[0..self.error_count];
         }
     };
@@ -2697,4 +2697,23 @@ test "raw values returned iff include_raw is set to true" {
     defer raw_ri.deinit();
     const raw_fi = (try raw_ri.next()).?;
     try std.testing.expectEqualStrings("200.00", (try raw_fi.next()).?.raw.?);
+}
+
+test "BoundedDiagnostics.errors returns a view into the diagnostics, not a copy" {
+    var diags: BoundedDiagnostics(4) = .empty;
+    try diags.addError(.{
+        .message = "error parsing numeric value",
+        .level = .err,
+        .line = 3,
+        .column = 15,
+    });
+
+    // `errors()` hands out a slice of `self.buffer`, so it has to be *our*
+    // buffer. Taking `self` by value copies the whole struct, and the slice then
+    // points into a temporary that dies with the call: every read through it is
+    // a read of a dead stack frame.
+    try std.testing.expectEqual(
+        @intFromPtr(&diags.buffer),
+        @intFromPtr(diags.errors().ptr),
+    );
 }
