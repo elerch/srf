@@ -859,7 +859,10 @@ pub const RecordIterator = struct {
                 }
             } else {
                 // We should be on a delimiter, otherwise, we should be at the end
-                if (state.current_line == null) return error.ParseFailed;
+                if (state.current_line == null) {
+                    try parseError("current line is null", state);
+                    return error.ParseFailed; // fatal
+                }
                 state.current_line = state.current_line.?[state.partial_line_column..]; // can't use l here because line may have been reassigned
                 state.partial_line_column = 0;
                 if (state.current_line.?.len == 0) {
@@ -870,8 +873,15 @@ pub const RecordIterator = struct {
                     return field;
                 } else {
                     if (state.current_line.?[0] != state.field_delimiter) {
-                        log.err("reset line for next item, first char not '{c}':{?s}", .{ state.field_delimiter, state.current_line });
-                        return error.ParseFailed;
+                        var buf: [256]u8 = undefined;
+                        const msg = std.fmt.bufPrint(
+                            &buf,
+                            "reset line for next item, first char not '{c}'",
+                            .{state.field_delimiter},
+                        ) catch @panic("bufPrint has no room but should absolutely have more room");
+
+                        try parseError(msg, state);
+                        return error.ParseFailed; // this is fatal
                     }
                     state.current_line = state.current_line.?[1..];
                 }
