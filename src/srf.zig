@@ -346,10 +346,11 @@ pub const Value = union(enum) {
                 _ = try state.reader.discardDelimiterExclusive('\n');
             }
         } else if (past_val[0] != state.field_delimiter) {
+            const extra_bytes = std.mem.indexOfScalar(u8, past_val, state.field_delimiter) orelse past_val.len;
             const msg = std.fmt.bufPrint(
                 &buf,
                 "field value has {} additional bytes. Perhaps length should be restated as {}?",
-                .{ past_val.len, past_val.len + declared_size },
+                .{ extra_bytes, extra_bytes + declared_size },
             ) catch "field value has additional bytes. Perhaps length should be restated";
             // we can try to advance the reader to the next field, but we might be cooked
             try parseError(msg, state);
@@ -943,15 +944,20 @@ pub const RecordIterator = struct {
                     return field;
                 } else {
                     if (state.current_line.?[0] != state.field_delimiter) {
-                        var buf: [256]u8 = undefined;
-                        const msg = std.fmt.bufPrint(
-                            &buf,
-                            "expected '{c}' or end of line after value; check the length prefix",
-                            .{state.field_delimiter},
-                        ) catch @panic("bufPrint has no room but should absolutely have more room");
-
-                        try parseError(msg, state);
-                        return error.ParseFailed; // this is fatal
+                        // We're going to try to recover from this situation,
+                        // but we're dealing with invalid srf at this point,
+                        // so no guarantees. Note that our line/column counter
+                        // is already advanced in this situation, as this
+                        // branch should only trigger in compact mode when
+                        // length is short
+                        if (std.mem.indexOfScalar(u8, state.current_line.?, state.field_delimiter)) |i| {
+                            log.info("attempting recovery from invalid srf. check diagnostics for more information", .{});
+                            log.debug(
+                                "invalid srf recovery:\n\t\tcurrent_line: '{s}'\n\t\trevised line: '{s}'",
+                                .{ state.current_line.?, state.current_line.?[i..] },
+                            );
+                            state.current_line = state.current_line.?[i..]; //reset to be on the delimiter as expected
+                        }
                     }
                     state.current_line = state.current_line.?[1..];
                 }
@@ -2795,6 +2801,47 @@ test "BoundedDiagnostics.errors returns a view into the diagnostics, not a copy"
     );
 }
 
+test "compact format: a length prefix shorter than the line is reported exactly once" {
+    // const lvl = std.testing.log_level;
+    // defer std.testing.log_level = lvl;
+    // std.testing.log_level = .debug;
+
+    const data =
+        \\#!srfv1
+        \\k:3:hello,foo::bar
+        \\
+    ;
+    const allocator = std.testing.allocator;
+    var reader = std.Io.Reader.fixed(data);
+    var diags: BoundedDiagnostics(10) = .empty;
+    var diag: Diagnostics = diags.diagnostics();
+
+    var it = try iterator(&reader, allocator, .{ .diagnostics = &diag });
+    defer it.deinit();
+    const record = try it.next();
+    try std.testing.expect(record != null);
+    const k = try record.?.next();
+    try std.testing.expect(k != null);
+    try std.testing.expect(k.?.value != null);
+    try std.testing.expect(k.?.value.? == .string);
+    try std.testing.expectEqualStrings("hel", k.?.value.?.string);
+
+    const errors = diags.errors();
+    try std.testing.expectEqual(@as(usize, 1), errors.len);
+    try std.testing.expectEqual(@as(usize, 2), errors[0].line);
+
+    // The parser should recover from this underflow on the length in this
+    // situation, but we should still see a ParseError at the end of the stream
+    const foo = try record.?.next();
+    try std.testing.expect(foo != null);
+    try std.testing.expect(foo.?.value != null);
+    try std.testing.expect(foo.?.value.? == .string);
+    try std.testing.expectEqualStrings("bar", foo.?.value.?.string);
+
+    // Any attempt to move to the next record should trigger parsefailed. But
+    // at least we've gotten to the point of consuming the full record
+    try std.testing.expectError(error.ParseFailed, it.next());
+}
 test "long format: a length prefix shorter than the line is reported" {
     // In long format `next` takes the `field_delimiter == '\n'` branch and calls
     // nextLine() unconditionally, discarding whatever was left of the line. So
