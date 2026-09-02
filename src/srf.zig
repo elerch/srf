@@ -331,7 +331,8 @@ pub const Value = union(enum) {
         // be a comma. If in long mode, we could have whitespace + comment
         var buf: [256]u8 = undefined;
         if (state.field_delimiter == '\n') {
-            if (std.mem.trimStart(u8, past_val, std.ascii.whitespace[0..])[0] != '#') {
+            const rest = std.mem.trimStart(u8, past_val, std.ascii.whitespace[0..]);
+            if (rest.len > 0 and rest[0] != '#') {
                 const msg = std.fmt.bufPrint(
                     &buf,
                     "line has {} additional bytes after field value. Perhaps length should be restated as {}?",
