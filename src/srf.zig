@@ -876,7 +876,7 @@ pub const RecordIterator = struct {
                         var buf: [256]u8 = undefined;
                         const msg = std.fmt.bufPrint(
                             &buf,
-                            "reset line for next item, first char not '{c}'",
+                            "expected '{c}' or end of line after value; check the length prefix",
                             .{state.field_delimiter},
                         ) catch @panic("bufPrint has no room but should absolutely have more room");
 
