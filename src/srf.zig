@@ -674,6 +674,7 @@ pub const RecordIterator = struct {
                 // we don't want to trim the end, as there might be a key/value field
                 // with a string including important trailing whitespace
                 const trimmed_line = std.mem.trimStart(u8, raw_line, &std.ascii.whitespace);
+                state.column += raw_line.len - trimmed_line.len;
                 if (std.mem.startsWith(u8, trimmed_line, "#") and !std.mem.startsWith(u8, trimmed_line, "#!")) continue;
                 return trimmed_line;
             }
@@ -2725,5 +2726,42 @@ test "BoundedDiagnostics.errors returns a view into the diagnostics, not a copy"
     try std.testing.expectEqual(
         @intFromPtr(&diags.buffer),
         @intFromPtr(diags.errors().ptr),
+    );
+}
+/// Column of the first reported diagnostic, or an error if there wasn't one.
+fn firstErrorColumn(data: []const u8) !usize {
+    var reader = std.Io.Reader.fixed(data);
+    var diags: BoundedDiagnostics(10) = .empty;
+    var diag: Diagnostics = diags.diagnostics();
+
+    var it = try iterator(&reader, std.testing.allocator, .{ .diagnostics = &diag });
+    defer it.deinit();
+    while (it.next() catch null) |_| {}
+
+    const errors = diags.errors();
+    if (errors.len == 0) return error.NoDiagnosticReported;
+    return errors[0].column;
+}
+
+test "column accounts for indentation that nextLine trimmed" {
+    // `nextLine` trims leading whitespace but resets column to 1, so an indented
+    // field and an unindented one report the same column even though the whole
+    // field moved right. Asserting the *difference* rather than an absolute
+    // column keeps this independent of where the column should point within the
+    // field, which is still an open question elsewhere in these tests.
+    const plain = "#!srfv1\n#!long\nname:num:abc\n";
+    const indented = "#!srfv1\n#!long\n    name:num:abc\n";
+
+    const plain_col = try firstErrorColumn(plain);
+    const indented_col = try firstErrorColumn(indented);
+    try std.testing.expectEqual(plain_col + 4, indented_col);
+}
+
+test "a tab counts as one column" {
+    const plain = "#!srfv1\n#!long\nname:num:abc\n";
+    const tabbed = "#!srfv1\n#!long\n\tname:num:abc\n";
+    try std.testing.expectEqual(
+        (try firstErrorColumn(plain)) + 1,
+        try firstErrorColumn(tabbed),
     );
 }
