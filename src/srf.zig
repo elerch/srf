@@ -103,6 +103,7 @@ const ValueWithMetaData = struct {
     item_value: ?Value,
     error_parsing: bool = false,
     reader_advanced: bool = false,
+    length_prefix_detected_underflow: usize = 0,
 };
 /// A parsed SRF value. Each field in a record has a key and an optional `Value`.
 pub const Value = union(enum) {
@@ -280,11 +281,13 @@ pub const Value = union(enum) {
         if (rest_of_data.len >= size) {
             // We fit on this line, everything is "normal"
             const val = rest_of_data[0..size];
+            var underflow: usize = 0;
             if (val.len < rest_of_data.len) {
                 const past_val = rest_of_data[size..];
-                try checkShortPrefix(past_val, size, state);
+                underflow = try checkShortPrefix(past_val, size, state, false);
             }
             return .{
+                .length_prefix_detected_underflow = underflow,
                 .item_value = .{ .string = try dupe(
                     state.*,
                     val,
@@ -304,28 +307,31 @@ pub const Value = union(enum) {
         // error, or end of stream, all of these are fatal. Our reader is currently
         // past the newline, so we have to remove a character from size to account.
         try state.reader.readSliceAll(buf[rest_of_data.len + 1 ..]);
+        // Because we've now advanced the line, we need to reset everything
+        state.line += std.mem.count(u8, buf, "\n");
+        state.column = buf.len - std.mem.lastIndexOf(u8, buf, "\n").?;
+        state.partial_line_column = state.column;
         // However, we want to be past the end of the *next* newline too (in long
         // format mode)
         var long_format_ok = false;
         if (delimiter == '\n' and state.reader.peekByte() catch 'x' == '\n') {
             state.reader.toss(1);
+            state.line += 1;
             long_format_ok = true; // in long format, the bytes ended directly on a newline, so we're good
         }
-        // Because we've now advanced the line, we need to reset everything
-        state.line += std.mem.count(u8, buf, "\n");
-        state.column = buf.len - std.mem.lastIndexOf(u8, buf, "\n").?;
-        state.partial_line_column = state.column;
         // If we're short, we need to actually look ahead here to detect that
         const val_to_eol = state.reader.peekDelimiterExclusive('\n') catch "";
         log.debug("multiline verification. val_to_eol: '{s}', val: '{s}'", .{ val_to_eol, buf });
+        var underflow: usize = 0;
         if (!long_format_ok and val_to_eol.len > 0)
-            try checkShortPrefix(val_to_eol, size, state);
+            underflow = try checkShortPrefix(val_to_eol, size, state, true);
         return .{
+            .length_prefix_detected_underflow = underflow,
             .item_value = .{ .string = buf },
             .reader_advanced = true,
         };
     }
-    inline fn checkShortPrefix(past_val: []const u8, declared_size: usize, state: *RecordIterator.State) ParseError!void {
+    inline fn checkShortPrefix(past_val: []const u8, declared_size: usize, state: *RecordIterator.State, advance_reader: bool) ParseError!usize {
         // there is a concern now the length specified might be short,
         // we need to check. If this is compact mode, the next byte should
         // be a comma. If in long mode, we could have whitespace + comment
@@ -339,13 +345,15 @@ pub const Value = union(enum) {
                     .{ past_val.len, past_val.len + declared_size },
                 ) catch "line has additional bytes after field value. Perhaps length should be restated";
                 try parseError(msg, state);
-                state.line += 1;
-                state.column = 1; // column is human indexed (one-based)
-                state.partial_line_column = 0; // partial_line_column is zero indexed for computers
-                // kill the rest of this line
-                _ = try state.reader.discardDelimiterExclusive('\n');
+                // Kill the rest of this line
+                if (advance_reader) {
+                    _ = try state.reader.takeDelimiterExclusive('\n');
+                    return 0;
+                }
+                return past_val.len;
             }
         } else if (past_val[0] != state.field_delimiter) {
+            // compact form
             const extra_bytes = std.mem.indexOfScalar(u8, past_val, state.field_delimiter) orelse past_val.len;
             const msg = std.fmt.bufPrint(
                 &buf,
@@ -354,10 +362,9 @@ pub const Value = union(enum) {
             ) catch "field value has additional bytes. Perhaps length should be restated";
             // we can try to advance the reader to the next field, but we might be cooked
             try parseError(msg, state);
-            const discarded = try state.reader.discardDelimiterExclusive(state.field_delimiter);
-            state.column += discarded;
-            state.partial_line_column += discarded;
+            return std.mem.indexOfScalar(u8, past_val, state.field_delimiter) orelse past_val.len;
         }
+        return 0;
     }
     inline fn fallbackAllocatorFor(state: *RecordIterator.State) !std.mem.Allocator {
         if (state.fallback_arena) |f| return f.allocator();
@@ -916,7 +923,11 @@ pub const RecordIterator = struct {
             // The difference between compact and line here is that compact we will instead of
             // line = try nextLine, we will do something like line = line[42..]
             if (state.field_delimiter == '\n') {
+                if (value.length_prefix_detected_underflow > 0)
+                    log.debug("long form: current line '{?s}'", .{state.current_line});
                 state.current_line = state.nextLine();
+                if (value.length_prefix_detected_underflow > 0)
+                    log.debug("long form: now on line '{?s}'", .{state.current_line});
                 if (state.current_line == null) {
                     state.end_of_record_reached = true;
                     return field;
@@ -934,6 +945,8 @@ pub const RecordIterator = struct {
                     try parseError("current line is null", state);
                     return error.ParseFailed; // fatal
                 }
+                // This usually means I screwed up and advanced the reader in value.parse...
+                std.debug.assert(state.partial_line_column <= state.current_line.?.len);
                 state.current_line = state.current_line.?[state.partial_line_column..]; // can't use l here because line may have been reassigned
                 state.partial_line_column = 0;
                 if (state.current_line.?.len == 0) {
@@ -944,22 +957,40 @@ pub const RecordIterator = struct {
                     return field;
                 } else {
                     if (state.current_line.?[0] != state.field_delimiter) {
-                        // We're going to try to recover from this situation,
-                        // but we're dealing with invalid srf at this point,
-                        // so no guarantees. Note that our line/column counter
-                        // is already advanced in this situation, as this
-                        // branch should only trigger in compact mode when
-                        // length is short
-                        if (std.mem.indexOfScalar(u8, state.current_line.?, state.field_delimiter)) |i| {
-                            log.info("attempting recovery from invalid srf. check diagnostics for more information", .{});
-                            log.debug(
-                                "invalid srf recovery:\n\t\tcurrent_line: '{s}'\n\t\trevised line: '{s}'",
-                                .{ state.current_line.?, state.current_line.?[i..] },
+                        if (value.length_prefix_detected_underflow > 0) {
+                            // We're going to try to recover from this situation,
+                            // but we're dealing with invalid srf at this point,
+                            // so no guarantees. Note that our line/column counter
+                            // is already advanced in this situation, as this
+                            // branch should only trigger in compact mode when
+                            // length is short
+
+                            log.info(
+                                "attempting recovery from invalid srf (length prefix underflow of {d}). check diagnostics for more information",
+                                .{value.length_prefix_detected_underflow},
                             );
-                            state.current_line = state.current_line.?[i..]; //reset to be on the delimiter as expected
+                            const old = state.current_line.?;
+                            const new = if (value.length_prefix_detected_underflow == state.current_line.?.len)
+                                null
+                            else
+                                state.current_line.?[value.length_prefix_detected_underflow + 1 ..];
+
+                            log.debug(
+                                "invalid srf recovery:\n\t\tcurrent_line: '{s}'\n\t\trevised line: '{?s}'",
+                                .{ old, new },
+                            );
+                            state.current_line = new; //reset to be on the delimiter as expected
+                            if (state.current_line == null) {
+                                // close out record
+                                state.current_line = state.nextLine();
+                                state.partial_line_column = 0;
+                                state.end_of_record_reached = true;
+                                return field;
+                            }
                         }
+                    } else {
+                        state.current_line = state.current_line.?[1..];
                     }
-                    state.current_line = state.current_line.?[1..];
                 }
             }
             return field;
@@ -3003,4 +3034,40 @@ test "a tab counts as one column" {
         (try firstErrorColumn(plain)) + 1,
         try firstErrorColumn(tabbed),
     );
+}
+fn drain(data: []const u8) !void {
+    var reader = std.Io.Reader.fixed(data);
+    var diags: BoundedDiagnostics(10) = .empty;
+    var diag: Diagnostics = diags.diagnostics();
+    var it = try iterator(&reader, std.testing.allocator, .{ .diagnostics = &diag });
+    defer it.deinit();
+    while (it.next() catch null) |fields| {
+        while (fields.next() catch null) |_| {}
+    }
+}
+
+test "compact: a short length prefix with no delimiter after it, then another line" {
+    try drain(
+        \\#!srfv1
+        \\k:2:abc
+        \\z::a
+        \\
+    ); // panics at :937
+}
+
+test "compact: a recovered short length prefix, then another line" {
+    try drain("#!srfv1\nk:3:hello,foo::bar\nz::a,b\n"); // panics at :870
+}
+
+test "compact: trailing whitespace after a short prefix, then another line" {
+    try drain("#!srfv1\nk:5:hello \nz::a\n"); // panics at :937
+}
+
+test "compact: single-line documents are unaffected" {
+    try drain("#!srfv1\nk:2:abc\n");
+    try drain("#!srfv1\nk:3:hello,foo::bar\n");
+}
+
+test "compact: correct length prefixes are unaffected" {
+    try drain("#!srfv1\nz:5:a,b,c,next::x\nq::v\n");
 }
