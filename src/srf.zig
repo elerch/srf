@@ -280,6 +280,10 @@ pub const Value = union(enum) {
         if (rest_of_data.len >= size) {
             // We fit on this line, everything is "normal"
             const val = rest_of_data[0..size];
+            if (val.len < rest_of_data.len) {
+                const past_val = rest_of_data[size..];
+                try checkShortPrefix(past_val, size, state);
+            }
             return .{
                 .item_value = .{ .string = try dupe(
                     state.*,
@@ -302,15 +306,56 @@ pub const Value = union(enum) {
         try state.reader.readSliceAll(buf[rest_of_data.len + 1 ..]);
         // However, we want to be past the end of the *next* newline too (in long
         // format mode)
-        if (delimiter == '\n') state.reader.toss(1);
+        var long_format_ok = false;
+        if (delimiter == '\n' and state.reader.peekByte() catch 'x' == '\n') {
+            state.reader.toss(1);
+            long_format_ok = true; // in long format, the bytes ended directly on a newline, so we're good
+        }
         // Because we've now advanced the line, we need to reset everything
         state.line += std.mem.count(u8, buf, "\n");
         state.column = buf.len - std.mem.lastIndexOf(u8, buf, "\n").?;
         state.partial_line_column = state.column;
+        // If we're short, we need to actually look ahead here to detect that
+        const val_to_eol = state.reader.peekDelimiterExclusive('\n') catch "";
+        log.debug("multiline verification. val_to_eol: '{s}', val: '{s}'", .{ val_to_eol, buf });
+        if (!long_format_ok and val_to_eol.len > 0)
+            try checkShortPrefix(val_to_eol, size, state);
         return .{
             .item_value = .{ .string = buf },
             .reader_advanced = true,
         };
+    }
+    inline fn checkShortPrefix(past_val: []const u8, declared_size: usize, state: *RecordIterator.State) ParseError!void {
+        // there is a concern now the length specified might be short,
+        // we need to check. If this is compact mode, the next byte should
+        // be a comma. If in long mode, we could have whitespace + comment
+        var buf: [256]u8 = undefined;
+        if (state.field_delimiter == '\n') {
+            if (std.mem.trimStart(u8, past_val, std.ascii.whitespace[0..])[0] != '#') {
+                const msg = std.fmt.bufPrint(
+                    &buf,
+                    "line has {} additional bytes after field value. Perhaps length should be restated as {}?",
+                    .{ past_val.len, past_val.len + declared_size },
+                ) catch "line has additional bytes after field value. Perhaps length should be restated";
+                try parseError(msg, state);
+                state.line += 1;
+                state.column = 1; // column is human indexed (one-based)
+                state.partial_line_column = 0; // partial_line_column is zero indexed for computers
+                // kill the rest of this line
+                _ = try state.reader.discardDelimiterExclusive('\n');
+            }
+        } else if (past_val[0] != state.field_delimiter) {
+            const msg = std.fmt.bufPrint(
+                &buf,
+                "field value has {} additional bytes. Perhaps length should be restated as {}?",
+                .{ past_val.len, past_val.len + declared_size },
+            ) catch "field value has additional bytes. Perhaps length should be restated";
+            // we can try to advance the reader to the next field, but we might be cooked
+            try parseError(msg, state);
+            const discarded = try state.reader.discardDelimiterExclusive(state.field_delimiter);
+            state.column += discarded;
+            state.partial_line_column += discarded;
+        }
     }
     inline fn fallbackAllocatorFor(state: *RecordIterator.State) !std.mem.Allocator {
         if (state.fallback_arena) |f| return f.allocator();
@@ -663,6 +708,7 @@ pub const RecordIterator = struct {
         allocator: std.mem.Allocator,
         fallback_arena: ?*std.heap.ArenaAllocator = null,
 
+        detailed_output: bool = false,
         /// Takes the next line, trimming leading whitespace and ignoring comments
         /// Directives (comments starting with #!) are preserved
         pub fn nextLine(state: *State) ?[]const u8 {
@@ -680,7 +726,29 @@ pub const RecordIterator = struct {
             }
         }
         pub fn format(self: State, writer: *std.Io.Writer) std.Io.Writer.Error!void {
-            try writer.print("line: {}, col: {}", .{ self.line, self.column });
+            if (!self.detailed_output) {
+                try writer.print("line: {}, col: {}", .{ self.line, self.column });
+                return;
+            }
+
+            try writer.print("\t                           line: {}\n", .{self.line});
+            try writer.print("\t                         column: {}\n", .{self.column});
+            try writer.print("\t            partial_line_column: {}\n", .{self.partial_line_column});
+            // try writer.print("reader: {}\n", .{self.reader});
+            // try writer.print("options: {}\n", .{self.options});
+
+            try writer.print("\t                    require_eof: {}\n", .{self.require_eof});
+            try writer.print("\t                      eof_found: {}\n", .{self.eof_found});
+            try writer.print("\t                   current_line: {?s}\n", .{self.current_line});
+
+            try writer.print("\t                field_delimiter: 0x{x}\n", .{self.field_delimiter});
+            try writer.print("\t long_form (field_delimeter \\n): {}\n", .{self.field_delimiter == '\n'});
+            try writer.print("\t          end_of_record_reached: {}\n", .{self.end_of_record_reached});
+            // try writer.print("field_iterator: {}\n", .{self.field_iterator});
+
+            // try writer.print("aa: {}\n", .{self.aa});
+            // try writer.print("allocator: {}\n", .{self.allocator});
+            // try writer.print("fallback_arena: {}\n", .{self.fallback_arena});
         }
     };
 
@@ -2244,9 +2312,6 @@ test "iterator with custom allocator - to() pattern" {
     try std.testing.expect(try ri.next() == null);
 }
 test "iterator with custom allocator - to() pattern, relaxed and custom coercion" {
-    const ll = std.testing.log_level;
-    std.testing.log_level = .debug;
-    defer std.testing.log_level = ll;
     // Example: streaming through records and fields using the iterator API.
     // This is the preferred parsing approach -- no intermediate slices are
     // allocated for fields or records.
@@ -2727,6 +2792,132 @@ test "BoundedDiagnostics.errors returns a view into the diagnostics, not a copy"
         @intFromPtr(&diags.buffer),
         @intFromPtr(diags.errors().ptr),
     );
+}
+
+test "long format: a length prefix shorter than the line is reported" {
+    // In long format `next` takes the `field_delimiter == '\n'` branch and calls
+    // nextLine() unconditionally, discarding whatever was left of the line. So
+    // `k:3:hello` silently becomes "hel": no diagnostic, no error, no log. The
+    // compact branch right below it reports exactly this condition.
+    const data =
+        \\#!srfv1
+        \\#!long
+        \\k:3:hello
+        \\
+    ;
+    const allocator = std.testing.allocator;
+    var reader = std.Io.Reader.fixed(data);
+    var diags: BoundedDiagnostics(10) = .empty;
+    var diag: Diagnostics = diags.diagnostics();
+
+    try std.testing.expect(blk: {
+        var it = iterator(&reader, allocator, .{ .diagnostics = &diag }) catch break :blk false;
+        defer it.deinit();
+        while (true) {
+            const record = it.next() catch |err| break :blk err == error.ParseFailed;
+            if (record == null) break :blk false; // parsed cleanly: the surplus was dropped
+        }
+    });
+
+    const errors = diags.errors();
+    try std.testing.expectEqual(@as(usize, 1), errors.len);
+    try std.testing.expectEqual(@as(usize, 3), errors[0].line);
+}
+
+test "long format: no error with comment after field val" {
+    // In long format `next` takes the `field_delimiter == '\n'` branch and calls
+    // nextLine() unconditionally, discarding whatever was left of the line. So
+    // `k:3:hello` silently becomes "hel": no diagnostic, no error, no log. The
+    // compact branch right below it reports exactly this condition.
+    const data =
+        \\#!srfv1
+        \\#!long
+        \\k:5:hello # a comment
+        \\
+    ;
+    const allocator = std.testing.allocator;
+    var reader = std.Io.Reader.fixed(data);
+    var diags: BoundedDiagnostics(10) = .empty;
+    var diag: Diagnostics = diags.diagnostics();
+
+    try std.testing.expect(blk: {
+        var it = iterator(&reader, allocator, .{ .diagnostics = &diag }) catch break :blk false;
+        defer it.deinit();
+        while (true) {
+            const record = it.next() catch |err| break :blk err == error.ParseFailed;
+            if (record == null) break :blk true; // parsed cleanly: the surplus was dropped
+        }
+    });
+
+    const errors = diags.errors();
+    try std.testing.expectEqual(@as(usize, 0), errors.len);
+}
+test "long format: a length prefix shorter than the line is fatal (multiple lines)" {
+    // In long format `next` takes the `field_delimiter == '\n'` branch and calls
+    // nextLine() unconditionally, discarding whatever was left of the line. So
+    // `k:3:hello` silently becomes "hel": no diagnostic, no error, no log. The
+    // compact branch right below it reports exactly this condition.
+    const data =
+        \\#!srfv1
+        \\#!long
+        \\k:4:he
+        \\llo
+        \\
+    ;
+    const allocator = std.testing.allocator;
+    var reader = std.Io.Reader.fixed(data);
+    var diags: BoundedDiagnostics(10) = .empty;
+    var diag: Diagnostics = diags.diagnostics();
+
+    try std.testing.expect(blk: {
+        var it = iterator(&reader, allocator, .{ .diagnostics = &diag }) catch break :blk false;
+        defer it.deinit();
+        while (true) {
+            const record = it.next() catch |err| break :blk err == error.ParseFailed;
+            if (record == null) break :blk false; // parsed cleanly: the surplus was dropped
+        }
+    });
+
+    const errors = diags.errors();
+    try std.testing.expectEqual(@as(usize, 1), errors.len);
+    try std.testing.expectEqual(@as(usize, 4), errors[0].line);
+}
+
+test "long format: a length prefix that consumes the whole line still parses" {
+    const data =
+        \\#!srfv1
+        \\#!long
+        \\k:5:hello
+        \\
+    ;
+    const allocator = std.testing.allocator;
+    var reader = std.Io.Reader.fixed(data);
+    var diags: BoundedDiagnostics(10) = .empty;
+    var diag: Diagnostics = diags.diagnostics();
+
+    var it = try iterator(&reader, allocator, .{ .diagnostics = &diag });
+    defer it.deinit();
+    while (try it.next()) |_| {}
+    try std.testing.expectEqual(@as(usize, 0), diags.errors().len);
+}
+
+test "long format: a multi-line length-prefixed value still parses" {
+    const data =
+        \\#!srfv1
+        \\#!long
+        \\bio:7:foo
+        \\bar
+        \\
+    ;
+    const allocator = std.testing.allocator;
+    var reader = std.Io.Reader.fixed(data);
+    var diags: BoundedDiagnostics(10) = .empty;
+    var diag: Diagnostics = diags.diagnostics();
+
+    var it = try iterator(&reader, allocator, .{ .diagnostics = &diag });
+    defer it.deinit();
+    while (try it.next()) |_| {}
+    try std.testing.expectEqual(@as(usize, 0), diags.errors().len);
 }
 /// Column of the first reported diagnostic, or an error if there wasn't one.
 fn firstErrorColumn(data: []const u8) !usize {
