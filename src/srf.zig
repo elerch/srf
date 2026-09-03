@@ -29,6 +29,12 @@ pub const ParseLineError = struct {
 };
 pub const Diagnostics = struct {
     ptr: *anyopaque,
+
+    /// adds an error to the diagnostics implementation. Note that this carries
+    /// no allocator and the ParseLineError message field may be stack allocated.
+    /// It is up to the implementation to manage diagnostics message lifetime
+    /// BoundedDiagnostics struct keeps an internal 256 byte/message buffer
+    /// for diagnostics messages
     addErrorFn: *const fn (*anyopaque, ParseLineError) ParseError!void,
     has_errors: bool = false,
 
@@ -37,6 +43,9 @@ pub const Diagnostics = struct {
         self.has_errors = true;
     }
 };
+
+/// Implements the Diagnostics interface, maintaining a 256 byte/message
+/// stack allocated buffer for error messages
 pub fn BoundedDiagnostics(comptime max_errors: usize) type {
     return struct {
         buffer: [max_errors]ParseLineError,
