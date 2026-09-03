@@ -143,7 +143,7 @@ pub const Value = union(enum) {
     ///
     /// This function is intended to be used by the SRF parser
     pub fn parse(str: []const u8, state: *RecordIterator.State, delimiter: u8) ParseError!ValueWithMetaData {
-        const type_val_sep_raw = std.mem.indexOfScalar(u8, str, ':');
+        const type_val_sep_raw = std.mem.findScalar(u8, str, ':');
         if (type_val_sep_raw == null) {
             try parseError("no type data or value after key", state);
             return ParseError.ParseFailed;
@@ -309,7 +309,7 @@ pub const Value = union(enum) {
         try state.reader.readSliceAll(buf[rest_of_data.len + 1 ..]);
         // Because we've now advanced the line, we need to reset everything
         state.line += std.mem.count(u8, buf, "\n");
-        state.column = buf.len - std.mem.lastIndexOf(u8, buf, "\n").?;
+        state.column = buf.len - std.mem.find(u8, buf, "\n").?;
         state.partial_line_column = state.column;
         // However, we want to be past the end of the *next* newline too (in long
         // format mode)
@@ -354,7 +354,7 @@ pub const Value = union(enum) {
             }
         } else if (past_val[0] != state.field_delimiter) {
             // compact form
-            const extra_bytes = std.mem.indexOfScalar(u8, past_val, state.field_delimiter) orelse past_val.len;
+            const extra_bytes = std.mem.findScalar(u8, past_val, state.field_delimiter) orelse past_val.len;
             const msg = std.fmt.bufPrint(
                 &buf,
                 "field value has {} additional bytes. Perhaps length should be restated as {}?",
@@ -362,7 +362,7 @@ pub const Value = union(enum) {
             ) catch "field value has additional bytes. Perhaps length should be restated";
             // we can try to advance the reader to the next field, but we might be cooked
             try parseError(msg, state);
-            return std.mem.indexOfScalar(u8, past_val, state.field_delimiter) orelse past_val.len;
+            return std.mem.findScalar(u8, past_val, state.field_delimiter) orelse past_val.len;
         }
         return 0;
     }
@@ -894,9 +894,9 @@ pub const RecordIterator = struct {
                 value.item_value == null or
                 value.item_value.? == .string) null else blk: {
                 // Basic parse to find raw value
-                const sep = std.mem.indexOfScalar(u8, rest, ':') orelse break :blk null;
+                const sep = std.mem.findScalar(u8, rest, ':') orelse break :blk null;
                 const after = rest[sep + 1 ..];
-                const end = std.mem.indexOfScalar(u8, after, state.field_delimiter) orelse after.len;
+                const end = std.mem.findScalar(u8, after, state.field_delimiter) orelse after.len;
                 break :blk after[0..end];
             };
 
@@ -965,7 +965,7 @@ pub const RecordIterator = struct {
                                 "attempting recovery from invalid srf (length prefix underflow of {d}). check diagnostics for more information",
                                 .{value.length_prefix_detected_underflow},
                             );
-                            state.current_line = if (std.mem.indexOfScalar(u8, state.current_line.?, state.field_delimiter)) |i|
+                            state.current_line = if (std.mem.findScalar(u8, state.current_line.?, state.field_delimiter)) |i|
                                 state.current_line.?[i + 1 ..]
                             else
                                 // Nothing on this line to resync to. The diagnostic is already recorded, so
@@ -2672,7 +2672,7 @@ test "Tombstone round-trip: forever with reason" {
     const tomb = try Tombstone.parse("forever not found in tiingo");
     var buf: [512]u8 = undefined;
     const out = try std.fmt.bufPrint(&buf, "{f}", .{fmt(Rec, items, .{ .tombstoned = tomb })});
-    try std.testing.expect(std.mem.indexOf(u8, out, "#!tombstoned=forever not found in tiingo") != null);
+    try std.testing.expect(std.mem.find(u8, out, "#!tombstoned=forever not found in tiingo") != null);
 
     var reader = std.Io.Reader.fixed(out);
     var ri = try iterator(&reader, std.testing.allocator, .{});
@@ -2688,7 +2688,7 @@ test "Tombstone round-trip: numeric until with reason" {
     const tomb = try Tombstone.parse("1782852900 delisted");
     var buf: [512]u8 = undefined;
     const out = try std.fmt.bufPrint(&buf, "{f}", .{fmt(Rec, items, .{ .tombstoned = tomb })});
-    try std.testing.expect(std.mem.indexOf(u8, out, "#!tombstoned=1782852900 delisted") != null);
+    try std.testing.expect(std.mem.find(u8, out, "#!tombstoned=1782852900 delisted") != null);
 
     var reader = std.Io.Reader.fixed(out);
     var ri = try iterator(&reader, std.testing.allocator, .{});
@@ -2704,7 +2704,7 @@ test "Tombstone round-trip: forever without reason" {
     const tomb = try Tombstone.parse("forever");
     var buf: [512]u8 = undefined;
     const out = try std.fmt.bufPrint(&buf, "{f}", .{fmt(Rec, items, .{ .tombstoned = tomb })});
-    try std.testing.expect(std.mem.indexOf(u8, out, "#!tombstoned=forever\n") != null);
+    try std.testing.expect(std.mem.find(u8, out, "#!tombstoned=forever\n") != null);
 
     var reader = std.Io.Reader.fixed(out);
     var ri = try iterator(&reader, std.testing.allocator, .{});
