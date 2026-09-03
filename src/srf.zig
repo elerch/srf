@@ -321,7 +321,7 @@ pub const Value = union(enum) {
         }
         // If we're short, we need to actually look ahead here to detect that
         const val_to_eol = state.reader.peekDelimiterExclusive('\n') catch "";
-        log.debug("multiline verification. val_to_eol: '{s}', val: '{s}'", .{ val_to_eol, buf });
+        // log.debug("multiline verification. val_to_eol: '{s}', val: '{s}'", .{ val_to_eol, buf });
         var underflow: usize = 0;
         if (!long_format_ok and val_to_eol.len > 0)
             underflow = try checkShortPrefix(val_to_eol, size, state, true);
@@ -910,7 +910,7 @@ pub const RecordIterator = struct {
             }
 
             if (value.reader_advanced and state.field_delimiter == ',') {
-                log.debug("advanced", .{});
+                // log.debug("advanced", .{});
                 // In compact format we'll stay on the same line
                 const real_column = state.column;
                 state.current_line = state.nextLine();
@@ -923,11 +923,7 @@ pub const RecordIterator = struct {
             // The difference between compact and line here is that compact we will instead of
             // line = try nextLine, we will do something like line = line[42..]
             if (state.field_delimiter == '\n') {
-                if (value.length_prefix_detected_underflow > 0)
-                    log.debug("long form: current line '{?s}'", .{state.current_line});
                 state.current_line = state.nextLine();
-                if (value.length_prefix_detected_underflow > 0)
-                    log.debug("long form: now on line '{?s}'", .{state.current_line});
                 if (state.current_line == null) {
                     state.end_of_record_reached = true;
                     return field;
@@ -969,16 +965,43 @@ pub const RecordIterator = struct {
                                 "attempting recovery from invalid srf (length prefix underflow of {d}). check diagnostics for more information",
                                 .{value.length_prefix_detected_underflow},
                             );
-                            const old = state.current_line.?;
-                            const new = if (value.length_prefix_detected_underflow == state.current_line.?.len)
+                            // NOTE: I have low confidence this is correct in
+                            // multi-line situations. It seems to work against
+                            // many of these contrived tests, but we're definitely
+                            // trying to re-interpret where things stand after
+                            // someone or something miskeyed a length prefix
+                            // Here it's a bit better to be wrong and not panic,
+                            // because the parser will fail at the next record
+                            // anyway, and the higher confidence diagnostics message
+                            // will direct the user more or less appropriately
+                            // const old = state.current_line.?;
+                            const line_underflow = if (!value.reader_advanced)
+                                value.length_prefix_detected_underflow
+                            else blk: {
+                                std.debug.assert(value.item_value.? == .string);
+                                const last_newline = std.mem.lastIndexOfScalar(u8, value.item_value.?.string, '\n') orelse return error.ParseFailed;
+                                // log.debug("last_newline: {d}", .{last_newline});
+                                if (value.length_prefix_detected_underflow < last_newline) break :blk 0;
+                                break :blk value.length_prefix_detected_underflow - last_newline;
+                            };
+                            // log.debug(
+                            //     "underflow: {d}, line_underflow: {d}, length: {d}, value.item_value.?.string: '{s}'",
+                            //     .{ value.length_prefix_detected_underflow, line_underflow, state.current_line.?.len, value.item_value.?.string },
+                            // );
+                            const new = if (line_underflow == state.current_line.?.len)
                                 null
-                            else
-                                state.current_line.?[value.length_prefix_detected_underflow + 1 ..];
+                            else blk: {
+                                // log.debug(
+                                //     "underflow: {d}, value.item_value.?.string: '{s}'",
+                                //     .{ value.length_prefix_detected_underflow, value.item_value.?.string },
+                                // );
+                                break :blk state.current_line.?[line_underflow + 1 ..];
+                            };
 
-                            log.debug(
-                                "invalid srf recovery:\n\t\tcurrent_line: '{s}'\n\t\trevised line: '{?s}'",
-                                .{ old, new },
-                            );
+                            // log.debug(
+                            //     "invalid srf recovery:\n\t\tcurrent_line: '{s}'\n\t\trevised line: '{?s}'",
+                            //     .{ old, new },
+                            // );
                             state.current_line = new; //reset to be on the delimiter as expected
                             if (state.current_line == null) {
                                 // close out record
@@ -3070,4 +3093,27 @@ test "compact: single-line documents are unaffected" {
 
 test "compact: correct length prefixes are unaffected" {
     try drain("#!srfv1\nz:5:a,b,c,next::x\nq::v\n");
+}
+test "compact underflow, follower is an indented field" {
+    try drain(
+        \\#!srfv1
+        \\bio:5:foo
+        \\  indented::v
+        \\
+    ); // panics at :976
+}
+test "control: follower contains a comma" {
+    try drain("#!srfv1\nbio:5:foo\n# com,ment\n"); // passes
+}
+test "control: follower is short enough to fit" {
+    const lvl = std.testing.log_level;
+    defer std.testing.log_level = lvl;
+    std.testing.log_level = .debug;
+    try drain("#!srfv1\nbio:5:foo\nab\n"); // passes
+}
+test "control: no underflow" {
+    try drain("#!srfv1\nbio:7:foo\nbar\n"); // passes
+}
+test "control: same shape in long format" {
+    try drain("#!srfv1\n#!long\nbio:5:foo\n# comment\n"); // passes
 }
