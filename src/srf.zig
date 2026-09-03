@@ -363,7 +363,7 @@ pub const Value = union(enum) {
             }
         } else if (past_val[0] != state.field_delimiter) {
             // compact form
-            const extra_bytes = std.mem.findScalar(u8, past_val, state.field_delimiter) orelse past_val.len;
+            const extra_bytes = likelyExtraBytes(past_val, state.field_delimiter);
             const msg = std.fmt.bufPrint(
                 &buf,
                 "field value has {} additional bytes. Perhaps length should be restated as {}?",
@@ -371,10 +371,27 @@ pub const Value = union(enum) {
             ) catch "field value has additional bytes. Perhaps length should be restated";
             // we can try to advance the reader to the next field, but we might be cooked
             try parseError(msg, state);
-            return std.mem.findScalar(u8, past_val, state.field_delimiter) orelse past_val.len;
+            return extra_bytes;
         }
         return 0;
     }
+
+    /// Bytes between the declared end of the value and where the field most likely
+    /// actually ends.
+    ///
+    /// A comma is ambiguous in compact format: field separator, or content inside
+    /// a length-prefixed value. It could even be a comma inside a key name. The
+    /// byte count normally tells them apart, so with the count wrong the next ':'
+    /// is the best anchor left, being where the following field's key ends. The
+    /// comma just before it is therefore the separator. Falling back to the first
+    /// comma covers a value that contains a colon itself.
+    fn likelyExtraBytes(past_val: []const u8, delimiter: u8) usize {
+        if (std.mem.findScalar(u8, past_val, ':')) |colon|
+            if (std.mem.findScalarLast(u8, past_val[0..colon], delimiter)) |sep|
+                return sep;
+        return std.mem.findScalar(u8, past_val, delimiter) orelse past_val.len;
+    }
+
     inline fn fallbackAllocatorFor(state: *RecordIterator.State) !std.mem.Allocator {
         if (state.fallback_arena) |f| return f.allocator();
         if (state.options.parse_allocator == .none) return error.AllocationRequired;
@@ -3202,4 +3219,69 @@ test "compact: a value ending one byte short, deeper into the next line" {
         .{ .record = 1, .key = "q", .value = "x" },
         .{ .record = 2, .key = "final", .value = "v" },
     }, 1);
+}
+
+/// Drives a parse to completion and checks the first diagnostic's text.
+///
+/// Walks fields as well as records: `checkShortPrefix` runs during field parsing,
+/// so draining records alone can miss it. Parse failures are ignored because the
+/// diagnostic, not the control flow, is what is under test.
+fn expectFirstDiagnostic(data: []const u8, expected: []const u8) !void {
+    var reader = std.Io.Reader.fixed(data);
+    var diags: BoundedDiagnostics(10) = .empty;
+    var diag: Diagnostics = diags.diagnostics();
+
+    var it = try iterator(&reader, std.testing.allocator, .{ .diagnostics = &diag });
+    defer it.deinit();
+    while (it.next() catch null) |fields| {
+        while (fields.next() catch null) |_| {}
+    }
+
+    const errors = diags.errors();
+    try std.testing.expect(errors.len > 0);
+    try std.testing.expectEqualStrings(expected, errors[0].message);
+}
+test "compact: suggested length uses the last delimiter before the next colon" {
+    // Fails today with "2 additional bytes ... restated as 6?". The value is a
+    // number with thousands separators, so the nearest comma is the wrong anchor.
+    // The colon after "really" is where the next field's key ends, so the comma
+    // just before it is the separator: 4 + 10 = 14.
+    try expectFirstDiagnostic(
+        "#!srfv1\nim_worth:4:23,000,000,000,really:bool:false\n",
+        "field value has 10 additional bytes. Perhaps length should be restated as 14?",
+    );
+}
+
+test "compact: a value containing both a delimiter and a colon" {
+    // Fails today with "1 additional bytes ... restated as 3?", which would leave
+    // the next field's key as "c,next". Under the rule the value is "a:b,c" and
+    // the next key is "next".
+    try expectFirstDiagnostic(
+        "#!srfv1\nk:2:a:b,c,next::v\n",
+        "field value has 3 additional bytes. Perhaps length should be restated as 5?",
+    );
+}
+test "compact: a colon with no delimiter before it falls back to the first delimiter" {
+    // The first colon sits inside the value's URL, so there is no comma before it
+    // and step 2 declines. The fallback is what gets this right.
+    try expectFirstDiagnostic(
+        "#!srfv1\nk:3:http://x,next::v\n",
+        "field value has 5 additional bytes. Perhaps length should be restated as 8?",
+    );
+}
+
+test "compact: no colon and no delimiter runs to end of line" {
+    try expectFirstDiagnostic(
+        "#!srfv1\nk:2:abc\n",
+        "field value has 1 additional bytes. Perhaps length should be restated as 3?",
+    );
+}
+
+test "long format ignores delimiters entirely" {
+    // A comma is ordinary text in long format, so the whole remainder counts and
+    // the rule must not apply there.
+    try expectFirstDiagnostic(
+        "#!srfv1\n#!long\nim_worth:4:23,000,000\n",
+        "line has 6 additional bytes after field value. Perhaps length should be restated as 10?",
+    );
 }
