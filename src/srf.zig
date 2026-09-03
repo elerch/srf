@@ -965,44 +965,12 @@ pub const RecordIterator = struct {
                                 "attempting recovery from invalid srf (length prefix underflow of {d}). check diagnostics for more information",
                                 .{value.length_prefix_detected_underflow},
                             );
-                            // NOTE: I have low confidence this is correct in
-                            // multi-line situations. It seems to work against
-                            // many of these contrived tests, but we're definitely
-                            // trying to re-interpret where things stand after
-                            // someone or something miskeyed a length prefix
-                            // Here it's a bit better to be wrong and not panic,
-                            // because the parser will fail at the next record
-                            // anyway, and the higher confidence diagnostics message
-                            // will direct the user more or less appropriately
-                            // const old = state.current_line.?;
-                            const line_underflow = if (!value.reader_advanced)
-                                value.length_prefix_detected_underflow
-                            else blk: {
-                                std.debug.assert(value.item_value.? == .string);
-                                const last_newline = std.mem.lastIndexOfScalar(u8, value.item_value.?.string, '\n') orelse return error.ParseFailed;
-                                // log.debug("last_newline: {d}", .{last_newline});
-                                if (value.length_prefix_detected_underflow < last_newline) break :blk 0;
-                                break :blk value.length_prefix_detected_underflow - last_newline;
-                            };
-                            // log.debug(
-                            //     "underflow: {d}, line_underflow: {d}, length: {d}, value.item_value.?.string: '{s}'",
-                            //     .{ value.length_prefix_detected_underflow, line_underflow, state.current_line.?.len, value.item_value.?.string },
-                            // );
-                            const new = if (line_underflow == state.current_line.?.len)
-                                null
-                            else blk: {
-                                // log.debug(
-                                //     "underflow: {d}, value.item_value.?.string: '{s}'",
-                                //     .{ value.length_prefix_detected_underflow, value.item_value.?.string },
-                                // );
-                                break :blk state.current_line.?[line_underflow + 1 ..];
-                            };
-
-                            // log.debug(
-                            //     "invalid srf recovery:\n\t\tcurrent_line: '{s}'\n\t\trevised line: '{?s}'",
-                            //     .{ old, new },
-                            // );
-                            state.current_line = new; //reset to be on the delimiter as expected
+                            state.current_line = if (std.mem.indexOfScalar(u8, state.current_line.?, state.field_delimiter)) |i|
+                                state.current_line.?[i + 1 ..]
+                            else
+                                // Nothing on this line to resync to. The diagnostic is already recorded, so
+                                // close the record out and let the next one be judged on its own merits.
+                                null;
                             if (state.current_line == null) {
                                 // close out record
                                 state.current_line = state.nextLine();
@@ -3075,15 +3043,15 @@ test "compact: a short length prefix with no delimiter after it, then another li
         \\k:2:abc
         \\z::a
         \\
-    ); // panics at :937
+    );
 }
 
 test "compact: a recovered short length prefix, then another line" {
-    try drain("#!srfv1\nk:3:hello,foo::bar\nz::a,b\n"); // panics at :870
+    try drain("#!srfv1\nk:3:hello,foo::bar\nz::a,b\n");
 }
 
 test "compact: trailing whitespace after a short prefix, then another line" {
-    try drain("#!srfv1\nk:5:hello \nz::a\n"); // panics at :937
+    try drain("#!srfv1\nk:5:hello \nz::a\n");
 }
 
 test "compact: single-line documents are unaffected" {
@@ -3100,20 +3068,129 @@ test "compact underflow, follower is an indented field" {
         \\bio:5:foo
         \\  indented::v
         \\
-    ); // panics at :976
+    );
 }
 test "control: follower contains a comma" {
-    try drain("#!srfv1\nbio:5:foo\n# com,ment\n"); // passes
+    try drain("#!srfv1\nbio:5:foo\n# com,ment\n");
 }
 test "control: follower is short enough to fit" {
-    const lvl = std.testing.log_level;
-    defer std.testing.log_level = lvl;
-    std.testing.log_level = .debug;
-    try drain("#!srfv1\nbio:5:foo\nab\n"); // passes
+    try drain("#!srfv1\nbio:5:foo\nab\n");
 }
 test "control: no underflow" {
-    try drain("#!srfv1\nbio:7:foo\nbar\n"); // passes
+    try drain("#!srfv1\nbio:7:foo\nbar\n");
 }
 test "control: same shape in long format" {
-    try drain("#!srfv1\n#!long\nbio:5:foo\n# comment\n"); // passes
+    try drain("#!srfv1\n#!long\nbio:5:foo\n# comment\n");
+}
+//
+// Reference: the same documents with the length srf itself suggests. These
+// establish what recovery should be aiming at, and they pass today.
+//
+
+test "reference: bio:8: lands on a delimiter" {
+    try expectFields("#!srfv1\nbio:8:foo\nz::a,y::b\nfinal::v\n", &.{
+        .{ .record = 1, .key = "bio", .value = "foo\nz::a" },
+        .{ .record = 1, .key = "y", .value = "b" },
+        .{ .record = 2, .key = "final", .value = "v" },
+    }, 0);
+}
+
+test "reference: bio:13: lands on a delimiter" {
+    try expectFields("#!srfv1\nbio:13:foo\nz:5:a,b,c,q::x\nfinal::v\n", &.{
+        .{ .record = 1, .key = "bio", .value = "foo\nz:5:a,b,c" },
+        .{ .record = 1, .key = "q", .value = "x" },
+        .{ .record = 2, .key = "final", .value = "v" },
+    }, 0);
+}
+
+const ExpectedField = struct { key: []const u8, value: []const u8, record: usize };
+
+/// Collects every field srf yields, with the record it belongs to, plus the
+/// diagnostics. Parse failures end collection rather than aborting, so a
+/// recovering parser can be checked on what it managed to produce.
+fn collect(
+    allocator: std.mem.Allocator,
+    data: []const u8,
+    out: *std.ArrayList(ExpectedField),
+    diag_count: *usize,
+    first_diag: *[]const u8,
+) !void {
+    var bounded = BoundedDiagnostics(10).empty;
+    var d: Diagnostics = bounded.diagnostics();
+    var reader = std.Io.Reader.fixed(data);
+
+    var it = try iterator(&reader, allocator, .{ .diagnostics = &d });
+    defer it.deinit();
+
+    var record: usize = 0;
+    outer: while (true) {
+        const fields = it.next() catch break :outer orelse break :outer;
+        record += 1;
+        while (true) {
+            const f = fields.next() catch break :outer orelse break;
+            const v = if (f.value) |vv| switch (vv) {
+                .string => |s| s,
+                else => "<non-string>",
+            } else "<null>";
+            try out.append(allocator, .{
+                .key = try allocator.dupe(u8, f.key),
+                .value = try allocator.dupe(u8, v),
+                .record = record,
+            });
+        }
+    }
+
+    diag_count.* = bounded.errors().len;
+    if (bounded.errors().len > 0) {
+        first_diag.* = try allocator.dupe(u8, bounded.errors()[0].message);
+    }
+}
+
+fn expectFields(data: []const u8, expected: []const ExpectedField, want_diags: usize) !void {
+    const allocator = std.testing.allocator;
+    var got: std.ArrayList(ExpectedField) = .empty;
+    defer {
+        for (got.items) |f| {
+            allocator.free(f.key);
+            allocator.free(f.value);
+        }
+        got.deinit(allocator);
+    }
+    var diag_count: usize = 0;
+    var first: []const u8 = "";
+    try collect(allocator, data, &got, &diag_count, &first);
+    defer if (first.len > 0) allocator.free(first);
+
+    if (first.len > 0) log.debug("diagnostic: {s}", .{first});
+    for (got.items) |f| {
+        log.debug("  got record {d}: '{s}' = '{s}'", .{ f.record, f.key, f.value });
+    }
+
+    try std.testing.expectEqual(want_diags, diag_count);
+    try std.testing.expectEqual(expected.len, got.items.len);
+    for (expected, got.items) |e, g| {
+        try std.testing.expectEqual(e.record, g.record);
+        try std.testing.expectEqualStrings(e.key, g.key);
+        try std.testing.expectEqualStrings(e.value, g.value);
+    }
+}
+
+test "compact: a value ending one byte short of a delimiter" {
+    // Declares 7, so bio is "foo\nz::" and the surplus is the single byte "a".
+    // Stepping over it and the following comma gives the same tail as the
+    // bio:8: reference.
+    try expectFields("#!srfv1\nbio:7:foo\nz::a,y::b\nfinal::v\n", &.{
+        .{ .record = 1, .key = "bio", .value = "foo\nz::" },
+        .{ .record = 1, .key = "y", .value = "b" },
+        .{ .record = 2, .key = "final", .value = "v" },
+    }, 1);
+}
+
+test "compact: a value ending one byte short, deeper into the next line" {
+    // Declares 12, so bio is "foo\nz:5:a,b," and the surplus is "c".
+    try expectFields("#!srfv1\nbio:12:foo\nz:5:a,b,c,q::x\nfinal::v\n", &.{
+        .{ .record = 1, .key = "bio", .value = "foo\nz:5:a,b," },
+        .{ .record = 1, .key = "q", .value = "x" },
+        .{ .record = 2, .key = "final", .value = "v" },
+    }, 1);
 }
