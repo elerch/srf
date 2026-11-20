@@ -597,6 +597,7 @@ fn coerce(name: []const u8, comptime T: type, val: ?Value, options: CoercionOpti
         .comptime_float, .comptime_int, .undefined, .null, .error_union => return error.CoercionNotPossible,
         .error_set, .@"fn", .@"opaque", .frame => return error.CoercionNotPossible,
         .@"anyframe", .vector, .enum_literal => return error.CoercionNotPossible,
+        .spirv => return error.CoercionNotPossible,
         .int => {
             if (options.strings_to_numbers and val.? == .string) {
                 // At this point, we're in lienent mode, so we'll do our lienient
@@ -1075,7 +1076,7 @@ pub const RecordIterator = struct {
             const ti = @typeInfo(T);
 
             switch (ti) {
-                .@"struct" => {
+                .@"struct" => |strct| {
                     // What is this magic? The FieldEnum creates a type (an enum)
                     // where each enum member has the name of a field in the struct
                     //
@@ -1094,20 +1095,20 @@ pub const RecordIterator = struct {
                     while (try self.next()) |f| {
                         // Linear scan fallback
                         var field_match = false;
-                        inline for (std.meta.fields(T)) |type_field| {
+                        inline for (strct.field_names, strct.field_types) |field_name, field_type| {
                             // To replicate the behavior of the record version of to,
                             // we need to only take the first version of the field,
                             // so if it's specified twice in the data, we will ignore
                             // all but the first instance
-                            if (!field_match and std.mem.eql(u8, type_field.name, f.key) and
-                                !@field(found, type_field.name))
+                            if (!field_match and std.mem.eql(u8, field_name, f.key) and
+                                !@field(found, field_name))
                             {
                                 field_match = true;
 
-                                const result = try coerce(type_field.name, type_field.type, f.value, options);
-                                @field(obj, type_field.name) = result.value;
+                                const result = try coerce(field_name, field_type, f.value, options);
+                                @field(obj, field_name) = result.value;
                                 // Now account for this in our magic found struct...
-                                @field(found, type_field.name) = true;
+                                @field(found, field_name) = true;
                                 if (result.require_free_original) {
                                     if (findAllocator(self.state.*, .value)) |alloc|
                                         switch (f.value.?) {
@@ -1126,20 +1127,24 @@ pub const RecordIterator = struct {
                     }
                     // Fill in the defaults for remaining fields. Throw if anything
                     // is missing both value (from above) and default (from here)
-                    inline for (std.meta.fields(T)) |type_field| {
-                        if (!@field(found, type_field.name)) {
+                    inline for (
+                        strct.field_names,
+                        strct.field_types,
+                        strct.field_attrs,
+                    ) |field_name, field_type, field_attrs| {
+                        if (!@field(found, field_name)) {
                             // We did not find this field above...revert to default value
-                            if (type_field.default_value_ptr) |ptr| {
-                                @field(obj, type_field.name) = @as(*const type_field.type, @ptrCast(@alignCast(ptr))).*;
+                            if (field_attrs.default_value_ptr) |ptr| {
+                                @field(obj, field_name) = @as(*const field_type, @ptrCast(@alignCast(ptr))).*;
                             } else {
-                                log.debug("Record could not be coerced. Field {s} not found on srf data, and no default value exists on the type", .{type_field.name});
+                                log.debug("Record could not be coerced. Field {s} not found on srf data, and no default value exists on the type", .{field_name});
                                 return error.FieldNotFoundOnFieldWithoutDefaultValue;
                             }
                         }
                     }
                     return obj;
                 },
-                .@"union" => {
+                .@"union" => |un| {
                     const active_tag_name = if (@hasDecl(T, "srf_tag_field"))
                         T.srf_tag_field
                     else
@@ -1155,9 +1160,12 @@ pub const RecordIterator = struct {
                     // We're done with the tag. Need to free it in case a custom
                     // allocator is in use
                     defer if (findAllocator(self.state.*, .value)) |a| a.free(active_tag);
-                    inline for (std.meta.fields(T)) |field_type| {
-                        if (std.mem.eql(u8, active_tag, field_type.name)) {
-                            return @unionInit(T, field_type.name, try self.to(field_type.type, options));
+                    inline for (un.field_names, un.field_types) |field_name, field_type| {
+                        if (std.mem.eql(u8, active_tag, field_name)) {
+                            return @unionInit(T, field_name, try self.to(
+                                field_type,
+                                options,
+                            ));
                         }
                     }
                     return error.ActiveTagDoesNotExist;
@@ -1498,9 +1506,13 @@ pub fn FromFormatter(comptime T: type) type {
             switch (ti) {
                 .@"struct" => |info| {
                     var first = true;
-                    inline for (info.fields) |f| {
-                        const field_val = @field(value, f.name);
-                        const is_default_val = if (f.defaultValue()) |d|
+                    inline for (
+                        info.field_names,
+                        info.field_types,
+                        info.field_attrs,
+                    ) |field_name, field_type, field_attr| {
+                        const field_val = @field(value, field_name);
+                        const is_default_val = if (field_attr.defaultValue(field_type)) |d|
                             std.meta.eql(field_val, d)
                         else
                             false;
@@ -1508,7 +1520,7 @@ pub fn FromFormatter(comptime T: type) type {
                             if (!first) {
                                 try writer.writeByte(delimiter);
                             }
-                            try self.formatField(f.type, f.name, field_val, writer);
+                            try self.formatField(field_type, field_name, field_val, writer);
                             first = false;
                         }
                     }
@@ -1568,7 +1580,7 @@ pub fn FromFormatter(comptime T: type) type {
                 .float => try self.formatValue(field_name, .{ .number = @floatCast(val) }, writer),
                 .bool => try self.formatValue(field_name, .{ .boolean = val }, writer),
                 .@"enum" => try self.formatValue(field_name, .{ .string = @tagName(val) }, writer),
-                .array => return error.WriteFailed,
+                .array, .spirv => return error.WriteFailed,
                 .@"struct", .@"union" => {
                     if (std.meta.hasMethod(F, "srfFormat"))
                         return val.srfFormat(field_name, writer);
@@ -1584,8 +1596,8 @@ pub fn FromFormatter(comptime T: type) type {
             if (value) |v|
                 switch (v) {
                     .string => |s| {
-                        const newlines = std.mem.containsAtLeastScalar(u8, s, 1, '\n');
-                        const commas = !self.options.long_format and std.mem.containsAtLeastScalar(u8, s, 1, ',');
+                        const newlines = std.mem.containsAtLeastScalar(u8, s, '\n', 1);
+                        const commas = !self.options.long_format and std.mem.containsAtLeastScalar(u8, s, ',', 1);
                         // Output the count if newlines exist
                         const count = if (newlines or commas) s.len else null;
                         if (count) |c| try writer.print("{d}", .{c});

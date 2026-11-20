@@ -109,11 +109,7 @@ pub fn build(b: *std.Build) void {
     // installation directory rather than directly from within the cache directory.
     run_cmd.step.dependOn(b.getInstallStep());
 
-    // This allows the user to pass arguments to the application in the build
-    // command itself, like this: `zig build run -- arg1 arg2 etc`
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
 
     // Creates an executable that will run `test` blocks from the provided module.
     // Here `mod` needs to define a target, which is why earlier we made sure to
@@ -171,26 +167,24 @@ pub fn build(b: *std.Build) void {
     // and reading its source code will allow you to master it.
 
     // Benchmark step
+    //
+    // Zig 0.17 has no custom (makeFn) steps, so this is built from Run steps:
+    // one per test data file (cached, so data is generated once), and one that
+    // runs hyperfine through a small driver program.
     const benchmark_step = b.step("benchmark", "Run benchmarks with hyperfine");
-    const benchmark_optimize = if (optimize == .Debug) .ReleaseSafe else optimize;
+    const benchmark_optimize = if (optimize == .debug) .safe else optimize;
     const benchmark_record_count = 100_000;
     const include_jsonl = b.option(bool, "benchmark-jsonl", "Include JSONL in benchmarks (slow)") orelse false;
-
-    // Check for hyperfine
-    const check_hyperfine = b.addSystemCommand(&.{ "sh", "-c", "command -v hyperfine >/dev/null 2>&1 || (echo 'Error: hyperfine not found. Install it with: cargo install hyperfine' >&2 && exit 1)" });
-    benchmark_step.dependOn(&check_hyperfine.step);
 
     // Build test data generator
     const gen_exe = b.addExecutable(.{
         .name = "generate_test_data",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/generate_test_data.zig"),
-            .target = target,
+            .target = b.graph.host,
             .optimize = benchmark_optimize,
         }),
     });
-    const install_gen = b.addInstallArtifact(gen_exe, .{});
-    check_hyperfine.step.dependOn(&install_gen.step);
 
     // Rebuild main executable with benchmark optimization
     const benchmark_exe = b.addExecutable(.{
@@ -204,127 +198,40 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    const install_benchmark_exe = b.addInstallArtifact(benchmark_exe, .{});
-    check_hyperfine.step.dependOn(&install_benchmark_exe.step);
 
-    const run_benchmark = BenchmarkStep.create(b, .{
-        .gen_exe = gen_exe,
-        .srf_exe = benchmark_exe,
-        .record_count = benchmark_record_count,
-        .include_jsonl = include_jsonl,
+    const driver_exe = b.addExecutable(.{
+        .name = "benchmark",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/benchmark.zig"),
+            .target = b.graph.host,
+        }),
     });
-    run_benchmark.step.dependOn(&check_hyperfine.step);
-    benchmark_step.dependOn(&run_benchmark.step);
-}
 
-const BenchmarkStep = struct {
-    step: std.Build.Step,
-    gen_exe: *std.Build.Step.Compile,
-    srf_exe: *std.Build.Step.Compile,
-    record_count: usize,
-    include_jsonl: bool,
+    const run_benchmark = b.addRunArtifact(driver_exe);
+    // Inherited stdio makes this always run, and holds the global stderr lock
+    // so hyperfine can draw its progress output in place.
+    run_benchmark.stdio = .inherit;
+    run_benchmark.addFileArg2(b.findProgramLazy(.{ .names = &.{"hyperfine"} }), .{});
+    run_benchmark.addArtifactArg2(benchmark_exe, .{});
 
-    pub fn create(owner: *std.Build, options: struct {
-        gen_exe: *std.Build.Step.Compile,
-        srf_exe: *std.Build.Step.Compile,
-        record_count: usize,
-        include_jsonl: bool,
-    }) *BenchmarkStep {
-        const self = owner.allocator.create(BenchmarkStep) catch @panic("OOM");
-        self.* = .{
-            .step = std.Build.Step.init(.{
-                .id = .custom,
-                .name = "run benchmark",
-                .owner = owner,
-                .makeFn = make,
-            }),
-            .gen_exe = options.gen_exe,
-            .srf_exe = options.srf_exe,
-            .record_count = options.record_count,
-            .include_jsonl = options.include_jsonl,
-        };
-        return self;
-    }
+    const benchmarks = [_]struct { gen_format: []const u8, ext: []const u8, srf_format: []const u8 }{
+        .{ .gen_format = "srf-compact", .ext = "srf", .srf_format = "srf" },
+        .{ .gen_format = "srf-long", .ext = "srf", .srf_format = "srf" },
+        .{ .gen_format = "json", .ext = "json", .srf_format = "json" },
+        .{ .gen_format = "jsonl", .ext = "jsonl", .srf_format = "jsonl" },
+    };
+    for (benchmarks) |bench| {
+        if (!include_jsonl and std.mem.eql(u8, bench.gen_format, "jsonl")) continue;
 
-    fn make(step: *std.Build.Step, _: std.Build.Step.MakeOptions) !void {
-        const b = step.owner;
-        const self: *BenchmarkStep = @fieldParentPtr("step", step);
-
-        const io = b.graph.io;
-        const gen_path = b.getInstallPath(.bin, self.gen_exe.name);
-        const exe_path = b.getInstallPath(.bin, self.srf_exe.name);
-        const count_str = b.fmt("{d}", .{self.record_count});
-
-        const formats = [_]struct { name: []const u8, ext: []const u8 }{
-            .{ .name = "srf-compact", .ext = "srf" },
-            .{ .name = "srf-long", .ext = "srf" },
-            .{ .name = "jsonl", .ext = "jsonl" },
-            .{ .name = "json", .ext = "json" },
-        };
-
-        var test_files: [4][]const u8 = undefined;
-        for (formats, 0..) |fmt, i| {
-            // Create hash from format name and record count
-            var hasher = std.hash.Wyhash.init(0);
-            hasher.update(fmt.name);
-            hasher.update(count_str);
-            const hash = hasher.final();
-
-            const hash_str = b.fmt("{x}", .{hash});
-            const cache_dir = b.cache_root.join(b.allocator, &.{ "o", hash_str }) catch @panic("OOM");
-            b.cache_root.handle.createDirPath(io, cache_dir) catch @panic("Could not create cache path");
-
-            const filename = b.fmt("test-{s}.{s}", .{ fmt.name, fmt.ext });
-            const filepath = b.pathJoin(&.{ cache_dir, filename });
-            test_files[i] = filepath;
-
-            // Check if file exists
-            if (b.cache_root.handle.access(io, filepath, .{})) {
-                continue; // File exists, skip generation
-            } else |_| {}
-
-            // Generate file
-            var child = try std.process.spawn(io, .{
-                .argv = &.{ gen_path, fmt.name, count_str },
-                .stdout = .pipe,
-            });
-
-            var buf: [4096]u8 = undefined;
-            var file_reader = child.stdout.?.reader(io, &buf);
-            var reader = &file_reader.interface;
-            const output = try reader.allocRemaining(b.allocator, .unlimited);
-            defer b.allocator.free(output);
-            const term = try child.wait(io);
-            if (term != .exited or term.exited != 0) return error.GenerationFailed;
-
-            try b.cache_root.handle.writeFile(io, .{ .sub_path = filepath, .data = output });
-        }
-
-        // Run hyperfine
-        var argv: std.ArrayList([]const u8) = .empty;
-        defer argv.deinit(b.allocator);
-
-        try argv.appendSlice(b.allocator, &.{ "hyperfine", "-w", "2" });
-        try argv.append(b.allocator, b.fmt("{s} srf <{s}", .{ exe_path, test_files[0] }));
-        try argv.append(b.allocator, b.fmt("{s} srf <{s}", .{ exe_path, test_files[1] }));
-        try argv.append(b.allocator, b.fmt("{s} json <{s}", .{ exe_path, test_files[3] }));
-        if (self.include_jsonl) {
-            try argv.append(b.allocator, b.fmt("{s} jsonl <{s}", .{ exe_path, test_files[2] }));
-        }
-
-        // We need to lock stderror so hyperfine can output progress in place
-        // SAFETY: buffer for locking
-        var buf: [1024]u8 = undefined; // I have no idea what the right size buffer should be
-        _ = try io.lockStderr(&buf, null);
-        defer io.unlockStderr();
-
-        var child = try std.process.spawn(io, .{
-            .argv = argv.items,
+        const gen = b.addRunArtifact(gen_exe);
+        gen.addArgs(&.{ bench.gen_format, b.fmt("{d}", .{benchmark_record_count}) });
+        const data = gen.captureStdOut(.{
+            .basename = b.fmt("test-{s}.{s}", .{ bench.gen_format, bench.ext }),
         });
 
-        const term = try child.wait(io);
-
-        if (term != .exited or term.exited != 0)
-            return error.BenchmarkFailed;
+        run_benchmark.addArg(bench.srf_format);
+        run_benchmark.addFileArg2(data, .{});
     }
-};
+
+    benchmark_step.dependOn(&run_benchmark.step);
+}
