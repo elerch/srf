@@ -11,7 +11,7 @@ jobs:
       - name: Check out repository code
         uses: actions/checkout@v4
       - name: Setup Zig
-        uses: https://codeberg.org/mlugg/setup-zig@v2.2.1
+        uses: https://github.com/mlugg/setup-zig@v2.2.1
       - name: Build project
         run: zig build --summary all
       - name: Run tests
