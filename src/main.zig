@@ -70,11 +70,11 @@ pub fn main(init: std.process.Init) !void {
     // Load all data into memory first for fair comparison
     var data: std.ArrayList(u8) = .empty;
     defer data.deinit(gpa);
-    try stdin.appendRemaining(gpa, &data, @enumFromInt(100 * 1024 * 1024));
+    try stdin.appendRemaining(gpa, &data, @fromBackingInt(@intCast(100 * 1024 * 1024)));
 
     if (std.mem.eql(u8, format, "srf")) {
         var reader = std.Io.Reader.fixed(data.items);
-        const it = try srf.iterator(&reader, allocator, .{ .parse_allocator = .none });
+        const it = try srf.iterator(&reader, allocator, .{ .parse_allocator = .none_with_fallback });
         defer it.deinit();
         // We want to touch every field, otherwise we're not really excercising
         // this appropriately
